@@ -1963,32 +1963,43 @@ class Renderer {
         return nullptr;
     }
 
-    // Begin a frame for the given content size; returns the inner content rect.
-    bool BeginFrame(const Settings& settings, int contentW, int contentH, float scale,
-                    D2D1_RECT_F& innerOut) {
+    // Begin a frame. `contentW/H` is the current (animating) size we PRESENT; `targetW/H` is the
+    // spring's destination and `settled` says the morph is done. To keep the expand/collapse morph
+    // smooth we size the backing DIB to the TARGET (allocated once per morph) and only present the
+    // current size from its top-left — this eliminates the per-frame CreateDIBSection realloc +
+    // shrink/grow GDI churn that made resizing choppy. Returns the inner content rect.
+    bool BeginFrame(const Settings& settings, int contentW, int contentH,
+                    int targetW, int targetH, bool settled, float scale, D2D1_RECT_F& innerOut) {
         const float padX = kRenderPadX * scale, padY = kRenderPadY * scale;
-        const int pxW = std::max(1, static_cast<int>(std::ceil(contentW + padX * 2.0f)));
+        const int pxW = std::max(1, static_cast<int>(std::ceil(contentW + padX * 2.0f)));  // present
         const int pxH = std::max(1, static_cast<int>(std::ceil(contentH + padY * 2.0f)));
-        bool resized = false;
-        if (pxW != bitmapWidth_ || pxH != bitmapHeight_) {
-            if (!CreateBackingBitmap(pxW, pxH)) return false;
-            resized = true;
+        const int aW = std::max(1, static_cast<int>(std::ceil(std::max(contentW, targetW) + padX * 2.0f)));
+        const int aH = std::max(1, static_cast<int>(std::ceil(std::max(contentH, targetH) + padY * 2.0f)));
+        // Grow the DIB straight to the target on the first morph frame; never realloc mid-morph;
+        // shrink it back to the exact present size only once the spring has settled.
+        const int needW = settled ? pxW : std::max(aW, bitmapWidth_);
+        const int needH = settled ? pxH : std::max(aH, bitmapHeight_);
+        if (needW != bitmapWidth_ || needH != bitmapHeight_) {
+            if (!CreateBackingBitmap(needW, needH)) return false;
         }
-        if (resized || g_layoutDirty.exchange(false)) {
+        // Resize/reposition the window whenever the PRESENT size changes (each morph frame) or on
+        // an external layout change (settings / display change).
+        if (pxW != presentW_ || pxH != presentH_ || g_layoutDirty.exchange(false)) {
             PositionOverlayWindow(settings, pxW, pxH);
+            presentW_ = pxW; presentH_ = pxH;
         }
         RECT rc = {0, 0, bitmapWidth_, bitmapHeight_};
         if (FAILED(target_->BindDC(memDc_, &rc))) return false;
         EnsureBrushes();  // device-dependent: must be created after BindDC
         target_->BeginDraw();
         target_->Clear(D2D1::ColorF(0, 0.0f));
-        innerOut = D2D1::RectF(padX, padY, padX + contentW, padY + contentH);
+        innerOut = D2D1::RectF(padX, padY, padX + contentW, padY + contentH);  // present region, top-left
         return true;
     }
     bool EndFrame(const Settings& settings) {
         if (FAILED(target_->EndDraw())) return false;
         POINT src = {0, 0};
-        SIZE size = {bitmapWidth_, bitmapHeight_};
+        SIZE size = {presentW_, presentH_};  // present the current size from the DIB's top-left
         RECT win = {}; GetWindowRect(hwnd_, &win);
         POINT dst = {win.left, win.top};
         BLENDFUNCTION blend = {};
@@ -2080,7 +2091,8 @@ class Renderer {
     uint64_t artGen_ = 0;
     HDC memDc_ = nullptr;
     HBITMAP dib_ = nullptr, oldBitmap_ = nullptr;
-    int bitmapWidth_ = 0, bitmapHeight_ = 0;
+    int bitmapWidth_ = 0, bitmapHeight_ = 0;   // allocated DIB size (may exceed the presented size)
+    int presentW_ = 0, presentH_ = 0;          // size actually shown via UpdateLayeredWindow
     float lastScale_ = 0.0f;
 };
 
@@ -2953,7 +2965,9 @@ DWORD WINAPI RenderThreadProc(void*) {
 
         if (needsRender) {
             D2D1_RECT_F inner;
-            if (renderer.BeginFrame(s, cw, ch, scale, inner)) {
+            int tgtW = (int)std::ceil(wSpring.target), tgtH = (int)std::ceil(hSpring.target);
+            bool settled = wSpring.AtRest() && hSpring.AtRest();
+            if (renderer.BeginFrame(s, cw, ch, tgtW, tgtH, settled, scale, inner)) {
                 DrawContext pdc = renderer.MakeContext(scale, now);  // brushes valid post-BindDC
                 pdc.artBmp = renderer.ArtBitmap(mediaNow.art.gen, mediaNow.art.w, mediaNow.art.h, mediaNow.art.bgra);
                 BindGlyphFormats(surface, renderer.GlyphFormat());
