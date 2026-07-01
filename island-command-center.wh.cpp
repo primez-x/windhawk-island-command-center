@@ -1680,6 +1680,7 @@ struct MediaCard : Widget {
 struct StackPanel : Widget {
     std::vector<std::unique_ptr<Widget>> children;
     float padX = 14.0f, padY = 12.0f, gap = 8.0f;
+    bool drawBg = false;   // fill a rounded panel backdrop (for the Open control center)
 
     Widget* Add(std::unique_ptr<Widget> w) {
         w->parent = this;
@@ -1716,6 +1717,12 @@ struct StackPanel : Widget {
         }
     }
     void Paint(DrawContext& dc) override {
+        if (drawBg) {
+            float r = 24.0f * dc.scale;
+            D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(bounds, r, r);
+            dc.dc->FillRoundedRectangle(rr, dc.panel);
+            dc.dc->DrawRoundedRectangle(rr, dc.border, 1.0f);
+        }
         for (auto& c : children) if (c->visible) c->Paint(dc);
     }
     Widget* HitTestDeep(D2D1_POINT_2F p) override {
@@ -2379,6 +2386,7 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
     // Open: full control center.
     auto panel = std::make_unique<StackPanel>();
     panel->padX = 16.0f; panel->padY = 14.0f; panel->gap = 10.0f;
+    panel->drawBg = true;  // rounded panel backdrop behind the whole control center
 
     // Header: big clock + long date (custom).
     auto header = std::make_unique<Custom>();
