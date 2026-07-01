@@ -75,6 +75,12 @@ network) and a clock mod / the Taskbar Styler (clock).
 - WeatherFahrenheit: true
   $name: Use Fahrenheit
   $description: Show temperature in °F (off = °C).
+- CaptureVolumeKeys: true
+  $name: Capture volume keys (skin the volume OSD)
+  $description: >-
+    Intercept the keyboard volume up/down/mute keys so the island shows its own
+    volume popup and the native Windows volume flyout never appears. Turn off to
+    use the standard Windows volume OSD.
 */
 // ==/WindhawkModSettings==
 
@@ -156,6 +162,7 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"Windhawk.IslandCommandCenter";
 constexpr UINT WM_APP_NEW_EVENT = WM_APP + 0x443;
 constexpr UINT WM_APP_DISMISS   = WM_APP + 0x444;
+constexpr UINT WM_APP_VOLKEY    = WM_APP + 0x445;  // wParam = VK_VOLUME_UP/DOWN/MUTE (from the key hook)
 
 constexpr float kRenderPadX = 26.0f;
 constexpr float kRenderPadY = 22.0f;
@@ -564,10 +571,12 @@ struct Settings {
     bool brightnessEnabled = true;
     std::wstring weatherCity;
     bool weatherFahrenheit = true;
+    bool captureVolumeKeys = true;
 };
 
 Settings g_settings;
 std::mutex g_settingsMutex;
+std::atomic<bool> g_captureVolKeys{true};  // lock-free mirror of Settings.captureVolumeKeys for the LL key hook
 
 void LoadSettings() {
     Settings next;
@@ -592,6 +601,8 @@ void LoadSettings() {
     next.brightnessEnabled = Wh_GetIntSetting(L"BrightnessEnabled") != 0;
     next.weatherCity = GetStringSettingCopy(L"WeatherCity");
     next.weatherFahrenheit = Wh_GetIntSetting(L"WeatherFahrenheit") != 0;
+    next.captureVolumeKeys = Wh_GetIntSetting(L"CaptureVolumeKeys") != 0;
+    g_captureVolKeys = next.captureVolumeKeys;  // lock-free mirror for the key hook
 
     std::lock_guard lock(g_settingsMutex);
     g_settings = std::move(next);
@@ -626,7 +637,12 @@ HANDLE g_stopEvent = nullptr;
 HANDLE g_renderThread = nullptr;
 HANDLE g_notifThread = nullptr;
 std::atomic<bool> g_layoutDirty{true};
+std::atomic<double> g_lastInputSec{-100.0};  // last pointer input; drives event-based repaint
+std::atomic<bool> g_waveWanted{false};       // true only when the live waveform is on screen
 HHOOK g_dismissHook = nullptr;
+HHOOK g_keyHook = nullptr;                    // WH_KEYBOARD_LL: volume-key capture
+HANDLE g_inputHookThread = nullptr;          // dedicated thread hosting the key hook
+DWORD g_inputHookTid = 0;
 
 void TriggerNudge() {
     static std::atomic<double> last{-1.0};
@@ -985,10 +1001,15 @@ DWORD WINAPI AudioThreadProc(void*) {
         return true;
     };
     while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
+        // Only sample the meter fast when the waveform is actually visible; otherwise idle so we
+        // don't wake ~22x/second forever feeding a strip nobody is looking at.
+        bool wanted = g_waveWanted.load();
         float peak = 0.0f;
-        if (ensure()) { if (FAILED(meter->GetPeakValue(&peak))) { meter.Reset(); dev.Reset(); peak = 0.0f; } }
-        WavePush(Clamp(peak, 0.0f, 1.0f));
-        WaitForSingleObject(g_stopEvent, 45);
+        if (wanted) {
+            if (ensure()) { if (FAILED(meter->GetPeakValue(&peak))) { meter.Reset(); dev.Reset(); peak = 0.0f; } }
+            WavePush(Clamp(peak, 0.0f, 1.0f));
+        }
+        WaitForSingleObject(g_stopEvent, wanted ? 45 : 400);
     }
     CoUninitialize();
     return 0;
@@ -1570,7 +1591,13 @@ struct AgendaList : Widget {
         dc.Text(hdr, dc.fSmall, D2D1::RectF(bounds.left + 4 * s, bounds.top, bounds.right - 4 * s, bounds.top + 22 * s), dc.muted, 0.85f);
         auto evs = ForSel();
         float y = bounds.top + 24.0f * s;
-        if (evs.empty()) { dc.Text(L"No events", dc.fBody, D2D1::RectF(bounds.left + 4 * s, y, bounds.right, y + 30 * s), dc.muted, 0.5f); return; }
+        if (evs.empty()) {
+            SYSTEMTIME n; GetLocalTime(&n);
+            bool selToday = (g_calSelYear.load() == n.wYear && g_calSelMonth.load() == n.wMonth && g_calSelDay.load() == n.wDay);
+            dc.Text(selToday ? L"Nothing upcoming" : L"No events", dc.fBody,
+                    D2D1::RectF(bounds.left + 4 * s, y, bounds.right, y + 30 * s), dc.muted, 0.5f);
+            return;
+        }
         for (auto& e : evs) {
             D2D1_RECT_F row = D2D1::RectF(bounds.left + 4 * s, y, bounds.right - 4 * s, y + 34 * s);
             dc.dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(row.left, row.top + 4 * s, row.left + 3 * s, row.bottom - 4 * s), 1.5f * s, 1.5f * s), dc.accent);
@@ -1583,11 +1610,32 @@ struct AgendaList : Widget {
         }
     }
    private:
+    static unsigned long long StampOf(const SYSTEMTIME& st) {
+        FILETIME ft{}; SystemTimeToFileTime(&st, &ft);
+        ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+        return u.QuadPart;
+    }
+    // Events for the selected day. When that day is today, show only what's still upcoming
+    // (drop meetings that have already ended); other days show the full day. Sorted by time.
     std::vector<IcsEvent> ForSel() {
         int y = g_calSelYear.load(), m = g_calSelMonth.load(), d = g_calSelDay.load();
         std::vector<IcsEvent> out;
         if (y == 0) return out;
-        for (auto& e : CalendarSnapshot()) if (e.start.wYear == y && e.start.wMonth == m && e.start.wDay == d) out.push_back(e);
+        SYSTEMTIME nowSt; GetLocalTime(&nowSt);
+        bool selToday = (y == nowSt.wYear && m == nowSt.wMonth && d == nowSt.wDay);
+        unsigned long long nowU = StampOf(nowSt);
+        for (auto& e : CalendarSnapshot()) {
+            if (!(e.start.wYear == y && e.start.wMonth == m && e.start.wDay == d)) continue;
+            if (selToday && !e.allDay) {
+                unsigned long long endU = StampOf(e.end.wYear ? e.end : e.start);
+                if (endU <= nowU) continue;  // already ended -> not upcoming
+            }
+            out.push_back(e);
+        }
+        std::sort(out.begin(), out.end(), [](const IcsEvent& a, const IcsEvent& b) {
+            if (a.allDay != b.allDay) return a.allDay;  // all-day first
+            return StampOf(a.start) < StampOf(b.start);
+        });
         return out;
     }
 };
@@ -2278,6 +2326,11 @@ std::wstring TimeString() {
     GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &t, nullptr, buf, ARRAYSIZE(buf));
     return buf;
 }
+// Changes once per displayed minute — used as a cheap "the clock text differs now" render trigger.
+int ClockMinuteKey() {
+    SYSTEMTIME t; GetLocalTime(&t);
+    return t.wHour * 60 + t.wMinute;
+}
 std::wstring DateStringShort() {
     SYSTEMTIME t; GetLocalTime(&t);
     wchar_t buf[64] = {};
@@ -2361,23 +2414,25 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
 
     if (s == SurfaceState::Expanded) {
         auto v = std::make_unique<Custom>();
-        v->fixedHeight = 112.0f * dc.scale;
+        v->fixedHeight = 126.0f * dc.scale;
         v->paint = [](DrawContext& d, D2D1_RECT_F b) {
             float rad = 22.0f * d.scale;
             d.dc->FillRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.panel);
             d.dc->DrawRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.border, 1.0f);
+            // Centered clock + date.
             D2D1_RECT_F clock = D2D1::RectF(b.left, b.top + 14.0f * d.scale, b.right, b.top + 58.0f * d.scale);
-            d.Text(TimeString(), d.fHuge, clock, d.text, 0.97f);
-            D2D1_RECT_F date = D2D1::RectF(b.left, b.top + 58.0f * d.scale, b.right, b.top + 80.0f * d.scale);
-            d.Text(DateStringLong(), d.fBody, date, d.muted, 0.8f);
-            D2D1_RECT_F bottom = D2D1::RectF(b.left, b.bottom - 26.0f * d.scale, b.right, b.bottom - 6.0f * d.scale);
+            d.Text(TimeString(), d.fHuge, clock, d.text, 0.97f, DWRITE_TEXT_ALIGNMENT_CENTER);
+            D2D1_RECT_F date = D2D1::RectF(b.left, b.top + 58.0f * d.scale, b.right, b.top + 82.0f * d.scale);
+            d.Text(DateStringLong(), d.fBody, date, d.muted, 0.8f, DWRITE_TEXT_ALIGNMENT_CENTER);
+            // Prominent (expanded) weather: glyph + temperature + description, centered.
+            D2D1_RECT_F wr = D2D1::RectF(b.left, b.bottom - 36.0f * d.scale, b.right, b.bottom - 6.0f * d.scale);
             if (WeatherFresh()) {
                 WeatherState w = WeatherSnapshot();
                 std::wstring line = WeatherShort() + (w.desc.empty() ? L"" : L"   " + w.desc);
-                d.Text(line, d.fSmall, bottom, d.muted, 0.75f, DWRITE_TEXT_ALIGNMENT_CENTER,
+                d.Text(line, d.fTitle, wr, d.text, 0.92f, DWRITE_TEXT_ALIGNMENT_CENTER,
                        DWRITE_PARAGRAPH_ALIGNMENT_CENTER, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
             } else {
-                d.Text(L"Click for controls", d.fSmall, bottom, d.muted, 0.5f);
+                d.Text(L"Click for controls", d.fSmall, wr, d.muted, 0.5f, DWRITE_TEXT_ALIGNMENT_CENTER);
             }
         };
         return v;
@@ -2524,6 +2579,31 @@ void RemoveDismissHook() {
     if (g_dismissHook) { UnhookWindowsHookEx(g_dismissHook); g_dismissHook = nullptr; }
 }
 
+// --- Volume-key capture ------------------------------------------------------
+// Modern Win11 renders its volume OSD via the compositor (no HWND to hide), so the
+// only reliable way to "skin" it is to swallow the hardware volume keys ourselves and
+// drive both the actual volume and the island's own popup. The hook lives on its own
+// thread with a tight message pump (a low-level hook must be serviced promptly).
+LRESULT CALLBACK LlKeyProc(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && g_captureVolKeys.load() && g_hwnd) {
+        auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        if (k->vkCode == VK_VOLUME_UP || k->vkCode == VK_VOLUME_DOWN || k->vkCode == VK_VOLUME_MUTE) {
+            if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+                PostMessageW(g_hwnd, WM_APP_VOLKEY, k->vkCode, 0);
+            return 1;  // swallow down AND up so Windows never shows its native flyout
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+DWORD WINAPI InputHookThreadProc(void*) {
+    g_inputHookTid = GetCurrentThreadId();
+    g_keyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LlKeyProc, GetModuleHandleW(nullptr), 0);
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    if (g_keyHook) { UnhookWindowsHookEx(g_keyHook); g_keyHook = nullptr; }
+    return 0;
+}
+
 D2D1_POINT_2F ClientPos(LPARAM lParam) {
     return D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
 }
@@ -2557,10 +2637,32 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_APP_DISMISS:
             if (g_surface) { g_surface->Dismiss(); g_layoutDirty = true; }
             return 0;
+        case WM_APP_VOLKEY: {  // a captured hardware volume key -> drive volume + island popup
+            float cur = 0.0f; bool mut = false;
+            g_volume.Get(cur, mut);
+            if (wParam == VK_VOLUME_MUTE) {
+                bool nm = !mut;
+                g_volume.SetMute(nm);
+                g_volMuted = nm;
+                ShowVolumeTransient((int)(cur * 100.0f + 0.5f), nm);
+            } else {
+                const float step = 0.02f;  // matches the native 2%-per-press step
+                float nv = Clamp(cur + (wParam == VK_VOLUME_UP ? step : -step), 0.0f, 1.0f);
+                g_volume.Set(nv);
+                if (mut) g_volume.SetMute(false);  // Windows unmutes on volume up/down
+                g_volScalar = nv; g_volMuted = false;
+                ShowVolumeTransient((int)(nv * 100.0f + 0.5f), false);
+            }
+            g_volSuppressPollUntil = NowSeconds() + 0.4;  // avoid a duplicate popup from PollVolume
+            g_layoutDirty = true;
+            return 0;
+        }
         case WM_MOUSEMOVE:
+            g_lastInputSec = NowSeconds();
             if (g_surface) g_surface->OnMove({PointerPhase::Move, ClientPos(lParam)});
             return 0;
         case WM_LBUTTONDOWN:
+            g_lastInputSec = NowSeconds();
             if (g_surface) {
                 bool handled = g_surface->OnDown({PointerPhase::Down, ClientPos(lParam)});
                 if (!handled && g_surface->state != SurfaceState::Open) g_surface->Open();
@@ -2568,10 +2670,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_layoutDirty = true;
             return 0;
         case WM_LBUTTONUP:
+            g_lastInputSec = NowSeconds();
             if (g_surface) g_surface->OnUp({PointerPhase::Up, ClientPos(lParam)});
             g_layoutDirty = true;
             return 0;
         case WM_MOUSEWHEEL:
+            g_lastInputSec = NowSeconds();
             if (g_surface) {
                 POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
                 ScreenToClient(hwnd, &pt);
@@ -2685,46 +2789,64 @@ DWORD WINAPI RenderThreadProc(void*) {
 
         bool widgetAnimating = surface.Tick(dt);
         bool sizeAnimating = !wSpring.AtRest() || !hSpring.AtRest();
-        bool interacting = surface.IsCapturing() || cursorInside;
 
         int cw = std::max(1, (int)std::ceil(wSpring.value));
         int ch = std::max(1, (int)std::ceil(hSpring.value));
 
         MediaState mediaNow = MediaSnapshot();
-        D2D1_RECT_F inner;
-        if (renderer.BeginFrame(s, cw, ch, scale, inner)) {
-            DrawContext pdc = renderer.MakeContext(scale, now);  // brushes valid post-BindDC
-            pdc.artBmp = renderer.ArtBitmap(mediaNow.art.gen, mediaNow.art.w, mediaNow.art.h, mediaNow.art.bgra);
-            BindGlyphFormats(surface, renderer.GlyphFormat());
-            surface.Layout(pdc, inner);
-            surface.Paint(pdc);
-            // Privacy dots overlay (camera = green, mic = orange), pulsing, top-right.
-            if (g_micActive.load() || g_camActive.load()) {
-                float pr = 3.5f * scale, px = inner.right - 12.0f * scale, py = inner.top + 11.0f * scale;
-                float pulse = 0.55f + 0.45f * sinf((float)now * 4.0f);
-                if (g_camActive.load()) {
-                    ComPtr<ID2D1SolidColorBrush> b;
-                    pdc.dc->CreateSolidColorBrush(D2D1::ColorF(0.2f, 0.85f, 0.35f, pulse), &b);
-                    if (b) { pdc.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(px, py), pr, pr), b.Get()); px -= 12.0f * scale; }
+        bool mediaLive = surface.state == SurfaceState::Open && mediaNow.active && mediaNow.playing;
+        g_waveWanted = mediaLive;  // let the audio-meter thread idle when the waveform is hidden
+        bool privacyLive = g_micActive.load() || g_camActive.load();
+        bool inputActive = (now - g_lastInputSec.load()) < 0.5;  // hover/drag responsiveness window
+
+        // A frame costs a full UpdateLayeredWindow re-composite of the (possibly large) panel
+        // through DWM. Do it only when something actually changed — resting the cursor over the
+        // Open panel must NOT drive continuous 60fps compositing (that spikes the whole desktop).
+        static bool lastCursorInside = false;
+        static int  lastClockKey = -1;
+        static bool firstFrame = true;
+        const int clockKey = ClockMinuteKey();
+        bool active = widgetAnimating || sizeAnimating || surface.IsCapturing() ||
+                      mediaLive || privacyLive || inputActive;
+        bool needsRender = firstFrame || active || g_layoutDirty.load() ||
+                           clockKey != lastClockKey || cursorInside != lastCursorInside;
+        lastCursorInside = cursorInside;
+        lastClockKey = clockKey;
+
+        if (needsRender) {
+            D2D1_RECT_F inner;
+            if (renderer.BeginFrame(s, cw, ch, scale, inner)) {
+                DrawContext pdc = renderer.MakeContext(scale, now);  // brushes valid post-BindDC
+                pdc.artBmp = renderer.ArtBitmap(mediaNow.art.gen, mediaNow.art.w, mediaNow.art.h, mediaNow.art.bgra);
+                BindGlyphFormats(surface, renderer.GlyphFormat());
+                surface.Layout(pdc, inner);
+                surface.Paint(pdc);
+                // Privacy dots overlay (camera = green, mic = orange), pulsing, top-right.
+                if (g_micActive.load() || g_camActive.load()) {
+                    float pr = 3.5f * scale, px = inner.right - 12.0f * scale, py = inner.top + 11.0f * scale;
+                    float pulse = 0.55f + 0.45f * sinf((float)now * 4.0f);
+                    if (g_camActive.load()) {
+                        ComPtr<ID2D1SolidColorBrush> b;
+                        pdc.dc->CreateSolidColorBrush(D2D1::ColorF(0.2f, 0.85f, 0.35f, pulse), &b);
+                        if (b) { pdc.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(px, py), pr, pr), b.Get()); px -= 12.0f * scale; }
+                    }
+                    if (g_micActive.load()) {
+                        ComPtr<ID2D1SolidColorBrush> b;
+                        pdc.dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.6f, 0.1f, pulse), &b);
+                        if (b) pdc.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(px, py), pr, pr), b.Get());
+                    }
                 }
-                if (g_micActive.load()) {
-                    ComPtr<ID2D1SolidColorBrush> b;
-                    pdc.dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.6f, 0.1f, pulse), &b);
-                    if (b) pdc.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(px, py), pr, pr), b.Get());
-                }
+                renderer.EndFrame(s);
+                firstFrame = false;
             }
-            renderer.EndFrame(s);
         }
 
         // Click-through policy.
         bool wantInteractive = (surface.state == SurfaceState::Open) || cursorInside || surface.IsCapturing();
         SetClickThrough(hwnd, !wantInteractive);
 
-        // Keep animating frames flowing; otherwise idle at ~30fps for the clock.
-        bool mediaLive = surface.state == SurfaceState::Open && mediaNow.active && mediaNow.playing;
-        bool privacyLive = g_micActive.load() || g_camActive.load();
-        bool keepBusy = widgetAnimating || sizeAnimating || interacting || mediaLive || privacyLive || g_layoutDirty.load();
-        WaitForSingleObject(g_stopEvent, keepBusy ? 16 : 200);
+        // 60fps while something is live; otherwise idle-poll for hover/clock without repainting.
+        WaitForSingleObject(g_stopEvent, active ? 16 : 100);
     }
 
     g_surface = nullptr;
@@ -2765,6 +2887,7 @@ bool StartThreads() {
     g_audioThread = CreateThread(nullptr, 0, AudioThreadProc, nullptr, 0, nullptr);
     g_privacyThread = CreateThread(nullptr, 0, PrivacyThreadProc, nullptr, 0, nullptr);
     g_weatherThread = CreateThread(nullptr, 0, WeatherThreadProc, nullptr, 0, nullptr);
+    g_inputHookThread = CreateThread(nullptr, 0, InputHookThreadProc, nullptr, 0, nullptr);
 #if ICC_HAS_NOTIFICATION_LISTENER
     g_notifThread = CreateThread(nullptr, 0, NotificationThreadProc, nullptr, 0, nullptr);
 #endif
@@ -2774,10 +2897,12 @@ void StopThreads() {
     if (g_stopEvent) SetEvent(g_stopEvent);
     if (g_brightEvent) SetEvent(g_brightEvent);
     if (g_calRefreshEvent) SetEvent(g_calRefreshEvent);
-    HANDLE handles[] = {g_renderThread, g_notifThread, g_brightThread, g_calThread, g_mediaThread, g_audioThread, g_privacyThread, g_weatherThread};
+    if (g_inputHookTid) PostThreadMessageW(g_inputHookTid, WM_QUIT, 0, 0);  // unblock GetMessage
+    HANDLE handles[] = {g_renderThread, g_notifThread, g_brightThread, g_calThread, g_mediaThread, g_audioThread, g_privacyThread, g_weatherThread, g_inputHookThread};
     for (HANDLE h : handles) if (h) WaitForSingleObject(h, 4000);
-    for (HANDLE* h : {&g_renderThread, &g_notifThread, &g_brightThread, &g_calThread, &g_mediaThread, &g_audioThread, &g_privacyThread, &g_weatherThread})
+    for (HANDLE* h : {&g_renderThread, &g_notifThread, &g_brightThread, &g_calThread, &g_mediaThread, &g_audioThread, &g_privacyThread, &g_weatherThread, &g_inputHookThread})
         if (*h) { CloseHandle(*h); *h = nullptr; }
+    g_inputHookTid = 0;
     if (g_brightEvent) { CloseHandle(g_brightEvent); g_brightEvent = nullptr; }
     if (g_calRefreshEvent) { CloseHandle(g_calRefreshEvent); g_calRefreshEvent = nullptr; }
     if (g_stopEvent) { CloseHandle(g_stopEvent); g_stopEvent = nullptr; }
