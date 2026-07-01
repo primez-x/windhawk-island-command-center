@@ -639,9 +639,10 @@ HANDLE g_notifThread = nullptr;
 std::atomic<bool> g_layoutDirty{true};
 std::atomic<double> g_lastInputSec{-100.0};  // last pointer input; drives event-based repaint
 std::atomic<bool> g_waveWanted{false};       // true only when the live waveform is on screen
-HHOOK g_dismissHook = nullptr;
+HHOOK g_dismissHook = nullptr;               // WH_MOUSE_LL: click-outside dismiss (on the input thread)
+std::atomic<bool> g_dismissActive{false};    // only act on the mouse hook while the panel is Open
 HHOOK g_keyHook = nullptr;                    // WH_KEYBOARD_LL: volume-key capture
-HANDLE g_inputHookThread = nullptr;          // dedicated thread hosting the key hook
+HANDLE g_inputHookThread = nullptr;          // dedicated thread hosting BOTH low-level hooks
 DWORD g_inputHookTid = 0;
 
 void TriggerNudge() {
@@ -845,6 +846,7 @@ void LaunchByAumid(const std::wstring& aumid) {
 // ---------------------------------------------------------------------------
 std::mutex g_calMutex;
 std::vector<IcsEvent> g_calEvents;
+std::atomic<uint64_t> g_calGen{0};  // bumps whenever g_calEvents is replaced (cache invalidation)
 std::atomic<bool> g_calLoaded{false};
 std::atomic<bool> g_calError{false};
 std::atomic<bool> g_calConfigured{false};
@@ -911,6 +913,7 @@ DWORD WINAPI CalendarThreadProc(void*) {
                 SYSTEMTIME w0 = ics_detail::AddDays(firstOfMonth, -45);
                 auto evs = ParseIcsEvents(ics, w0, 210);
                 { std::lock_guard lock(g_calMutex); g_calEvents = std::move(evs); }
+                g_calGen.fetch_add(1);  // invalidate agenda/calendar caches
                 g_calLoaded = true; g_calError = false;
             } else {
                 g_calError = true; g_calLoaded = true;
@@ -1502,6 +1505,8 @@ struct NotifRow : Widget {
     float lastScale_ = 1.0f;
 };
 
+int ClockMinuteKey();  // fwd (defined with the time helpers below)
+
 // --- CalendarView (interactive month grid) -----------------------------------
 struct CalendarView : Widget {
     float Measure(const DrawContext& dc, float) override { return 214.0f * dc.scale; }
@@ -1538,8 +1543,7 @@ struct CalendarView : Widget {
         for (int i = 0; i < 7; ++i)
             dc.Text(wd[i], dc.fSmall, D2D1::RectF(bounds.left + i * cellW, wkY, bounds.left + (i + 1) * cellW, wkY + 18 * s), dc.muted, 0.5f, DWRITE_TEXT_ALIGNMENT_CENTER);
 
-        std::unordered_set<int> evDays;
-        { auto evs = CalendarSnapshot(); for (auto& ev : evs) if (ev.start.wYear == vy && ev.start.wMonth == vm) evDays.insert(ev.start.wDay); }
+        const std::unordered_set<int>& evDays = EventDays(vy, vm);
         SYSTEMTIME now; GetLocalTime(&now);
         int fw = FirstWeekday(vy, vm), dim = ics_detail::DaysInMonth(vy, vm);
         float gridTop = bounds.top + 52.0f * s, rowH = (H(bounds) - 52.0f * s) / 6.0f;
@@ -1559,6 +1563,17 @@ struct CalendarView : Widget {
     }
    private:
     float lastScale_ = 1.0f;
+    uint64_t evGen_ = (uint64_t)-1; int evView_ = -1;
+    std::unordered_set<int> evDays_;
+    // Set of days-with-events for the viewed month; rebuilt only when the calendar data
+    // generation or the viewed month changes (not every paint/drag frame).
+    const std::unordered_set<int>& EventDays(int vy, int vm) {
+        uint64_t gen = g_calGen.load(); int vk = vy * 13 + vm;
+        if (gen == evGen_ && vk == evView_) return evDays_;
+        evGen_ = gen; evView_ = vk; evDays_.clear();
+        for (auto& ev : CalendarSnapshot()) if (ev.start.wYear == vy && ev.start.wMonth == vm) evDays_.insert(ev.start.wDay);
+        return evDays_;
+    }
     void Init() {
         if (g_calViewYear.load() == 0) { SYSTEMTIME n; GetLocalTime(&n); g_calViewYear = n.wYear; g_calViewMonth = n.wMonth; }
         if (g_calSelYear.load() == 0) { SYSTEMTIME n; GetLocalTime(&n); g_calSelYear = n.wYear; g_calSelMonth = n.wMonth; g_calSelDay = n.wDay; }
@@ -1589,7 +1604,7 @@ struct AgendaList : Widget {
         if (sd.wYear == 0) GetLocalTime(&sd);
         wchar_t hdr[64] = {}; GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &sd, L"dddd, MMMM d", hdr, ARRAYSIZE(hdr), nullptr);
         dc.Text(hdr, dc.fSmall, D2D1::RectF(bounds.left + 4 * s, bounds.top, bounds.right - 4 * s, bounds.top + 22 * s), dc.muted, 0.85f);
-        auto evs = ForSel();
+        const std::vector<IcsEvent>& evs = ForSel();
         float y = bounds.top + 24.0f * s;
         if (evs.empty()) {
             SYSTEMTIME n; GetLocalTime(&n);
@@ -1615,12 +1630,21 @@ struct AgendaList : Widget {
         ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
         return u.QuadPart;
     }
+    uint64_t cacheGen_ = (uint64_t)-1; int cacheSel_ = -1; int cacheMin_ = -1;
+    std::vector<IcsEvent> cache_;
     // Events for the selected day. When that day is today, show only what's still upcoming
     // (drop meetings that have already ended); other days show the full day. Sorted by time.
-    std::vector<IcsEvent> ForSel() {
+    // Cached: recomputed only when the calendar data, the selected day, or the minute changes
+    // (the "upcoming" cutoff advances by the minute) — NOT on every measure/paint/drag frame.
+    const std::vector<IcsEvent>& ForSel() {
         int y = g_calSelYear.load(), m = g_calSelMonth.load(), d = g_calSelDay.load();
-        std::vector<IcsEvent> out;
-        if (y == 0) return out;
+        int selKey = (y * 13 + m) * 32 + d;
+        int minKey = ClockMinuteKey();
+        uint64_t gen = g_calGen.load();
+        if (gen == cacheGen_ && selKey == cacheSel_ && minKey == cacheMin_) return cache_;
+        cacheGen_ = gen; cacheSel_ = selKey; cacheMin_ = minKey;
+        cache_.clear();
+        if (y == 0) return cache_;
         SYSTEMTIME nowSt; GetLocalTime(&nowSt);
         bool selToday = (y == nowSt.wYear && m == nowSt.wMonth && d == nowSt.wDay);
         unsigned long long nowU = StampOf(nowSt);
@@ -1630,13 +1654,13 @@ struct AgendaList : Widget {
                 unsigned long long endU = StampOf(e.end.wYear ? e.end : e.start);
                 if (endU <= nowU) continue;  // already ended -> not upcoming
             }
-            out.push_back(e);
+            cache_.push_back(e);
         }
-        std::sort(out.begin(), out.end(), [](const IcsEvent& a, const IcsEvent& b) {
+        std::sort(cache_.begin(), cache_.end(), [](const IcsEvent& a, const IcsEvent& b) {
             if (a.allDay != b.allDay) return a.allDay;  // all-day first
             return StampOf(a.start) < StampOf(b.start);
         });
-        return out;
+        return cache_;
     }
 };
 
@@ -2561,29 +2585,26 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
 // ---------------------------------------------------------------------------
 Surface* g_surface = nullptr;
 
+// Both low-level hooks below live on the dedicated InputHookThreadProc, which does nothing
+// but pump messages — so Windows can service them instantly. A low-level hook installed on
+// the render thread (which spends most of its time painting or sleeping in WaitForSingleObject)
+// would stall ALL system mouse input while the panel is up: the "cursor dragging through slime"
+// bug. These procs must therefore stay trivial and return fast.
 LRESULT CALLBACK LlMouseProc(int code, WPARAM wParam, LPARAM lParam) {
-    if (code == HC_ACTION && (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN)) {
+    if (code == HC_ACTION && g_dismissActive.load() &&
+        (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN)) {
         auto* p = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
         RECT r;
-        if (g_hwnd && GetWindowRect(g_hwnd, &r) && !PtInRect(&r, p->pt)) {
+        if (g_hwnd && GetWindowRect(g_hwnd, &r) && !PtInRect(&r, p->pt))
             PostMessageW(g_hwnd, WM_APP_DISMISS, 0, 0);
-        }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
-void InstallDismissHook() {
-    if (g_dismissHook) return;
-    g_dismissHook = SetWindowsHookExW(WH_MOUSE_LL, LlMouseProc, GetModuleHandleW(nullptr), 0);
-}
-void RemoveDismissHook() {
-    if (g_dismissHook) { UnhookWindowsHookEx(g_dismissHook); g_dismissHook = nullptr; }
-}
+// Just arm/disarm the (always-installed) mouse hook; no SetWindowsHookEx on the render thread.
+void InstallDismissHook() { g_dismissActive = true; }
+void RemoveDismissHook() { g_dismissActive = false; }
 
-// --- Volume-key capture ------------------------------------------------------
-// Modern Win11 renders its volume OSD via the compositor (no HWND to hide), so the
-// only reliable way to "skin" it is to swallow the hardware volume keys ourselves and
-// drive both the actual volume and the island's own popup. The hook lives on its own
-// thread with a tight message pump (a low-level hook must be serviced promptly).
+// Volume-key capture: swallow VK_VOLUME_* so the composition-rendered Win11 OSD never shows.
 LRESULT CALLBACK LlKeyProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && g_captureVolKeys.load() && g_hwnd) {
         auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
@@ -2597,10 +2618,13 @@ LRESULT CALLBACK LlKeyProc(int code, WPARAM wParam, LPARAM lParam) {
 }
 DWORD WINAPI InputHookThreadProc(void*) {
     g_inputHookTid = GetCurrentThreadId();
-    g_keyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LlKeyProc, GetModuleHandleW(nullptr), 0);
+    HINSTANCE mod = GetModuleHandleW(nullptr);
+    g_keyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LlKeyProc, mod, 0);
+    g_dismissHook = SetWindowsHookExW(WH_MOUSE_LL, LlMouseProc, mod, 0);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     if (g_keyHook) { UnhookWindowsHookEx(g_keyHook); g_keyHook = nullptr; }
+    if (g_dismissHook) { UnhookWindowsHookEx(g_dismissHook); g_dismissHook = nullptr; }
     return 0;
 }
 
@@ -2658,7 +2682,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
         case WM_MOUSEMOVE:
-            g_lastInputSec = NowSeconds();
+            // Do NOT treat bare mouse movement as a repaint trigger: the panel has no
+            // hover-driven visuals, so moving over it must be free. A live slider drag keeps
+            // rendering via IsCapturing(); scroll/press set their own dirty flags. This is the
+            // fix for "open the panel, move the mouse, it gets laggy" (full 60fps repaints).
             if (g_surface) g_surface->OnMove({PointerPhase::Move, ClientPos(lParam)});
             return 0;
         case WM_LBUTTONDOWN:
