@@ -628,6 +628,7 @@ struct SpringValue {
 // Shared interactive state (render thread + WndProc both on the render thread)
 // ---------------------------------------------------------------------------
 std::atomic<float> g_volScalar{0.0f};
+std::atomic<float> g_volDisplayScalar{0.0f};  // smoothed level the volume popup animates toward
 std::atomic<bool>  g_volMuted{false};
 std::atomic<bool>  g_volValid{false};
 double g_volSuppressPollUntil = 0.0;  // render-thread only
@@ -726,6 +727,7 @@ std::mutex g_notifMutex;
 std::vector<NotificationItem> g_notifs;          // newest-first (listener order)
 std::unordered_set<uint32_t> g_notifSuppressed;  // locally dismissed ids
 std::atomic<bool> g_notifSupported{false};
+std::atomic<uint64_t> g_notifGen{0};             // bumps on any list change (add/clear/dismiss) -> rebuild Open panel
 
 std::vector<NotificationItem> NotificationsSnapshot() {
     std::lock_guard lock(g_notifMutex);
@@ -749,6 +751,7 @@ void DismissNotification(uint32_t id) {
         } catch (...) {}
         winrt::uninit_apartment();
     }).detach();
+    g_notifGen.fetch_add(1);
     g_layoutDirty = true;
 }
 
@@ -767,6 +770,7 @@ void ClearAllNotifications() {
         } catch (...) {}
         winrt::uninit_apartment();
     }).detach();
+    g_notifGen.fetch_add(1);
     g_layoutDirty = true;
 }
 
@@ -823,7 +827,7 @@ DWORD WINAPI NotificationThreadProc(void*) {
                     }
                     g_notifs = std::move(items);
                 }
-                if (sig != lastSig) { lastSig = sig; TriggerNudge(); g_layoutDirty = true; }
+                if (sig != lastSig) { lastSig = sig; g_notifGen.fetch_add(1); TriggerNudge(); g_layoutDirty = true; }
             } catch (...) {}
             WaitForSingleObject(g_stopEvent, 1000);
         }
@@ -2199,6 +2203,18 @@ class Surface {
         root_ = BuildRoot(s, dc);
         captureTarget_ = nullptr;
         pressTarget_ = nullptr;
+        builtNotifGen_ = g_notifGen.load();  // snapshot the notif list version this tree was built from
+    }
+
+    // The Open panel's notification rows are baked at build time; when the list changes
+    // (arrival / dismiss / clear-all) rebuild the tree in place so it refreshes without a
+    // close/open. Skip while dragging so a rebuild never drops an in-flight slider capture.
+    bool RebuildIfDataChanged(const DrawContext& dc) {
+        if (state == SurfaceState::Open && !captureTarget_ && g_notifGen.load() != builtNotifGen_) {
+            BuildFor(SurfaceState::Open, dc);
+            return true;
+        }
+        return false;
     }
 
     // Returns desired content size for the current state.
@@ -2341,6 +2357,7 @@ class Surface {
     Widget* pressTarget_ = nullptr;
     std::optional<SurfaceState> pendingState_;
     double lastHoverTime_ = 0.0;
+    uint64_t builtNotifGen_ = 0;
 };
 
 // ---- formatting helpers ----
@@ -2421,12 +2438,13 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
             if (t.kind == 2) {  // volume: label + bar + percent
                 D2D1_RECT_F lr = D2D1::RectF(b.left + 44.0f * d.scale, b.top + 6.0f * d.scale, b.right - 12.0f * d.scale, b.top + 22.0f * d.scale);
                 d.Text(t.muted ? L"Muted" : t.line, d.fSmall, lr, d.muted, 0.8f);
-                wchar_t pc[8]; swprintf_s(pc, L"%d%%", t.value);
+                float shown = Clamp(g_volDisplayScalar.load(), 0.0f, 1.0f);  // smoothed, animates
+                wchar_t pc[8]; swprintf_s(pc, L"%d%%", (int)(shown * 100.0f + 0.5f));
                 d.Text(pc, d.fSmall, lr, d.text, 0.9f, DWRITE_TEXT_ALIGNMENT_TRAILING);
                 D2D1_RECT_F tr = D2D1::RectF(b.left + 44.0f * d.scale, b.bottom - 14.0f * d.scale, b.right - 12.0f * d.scale, b.bottom - 10.0f * d.scale);
                 float trad = H(tr) * 0.5f;
                 d.dc->FillRoundedRectangle(D2D1::RoundedRect(tr, trad, trad), d.track);
-                D2D1_RECT_F fill = tr; fill.right = tr.left + W(tr) * Clamp(t.value / 100.0f, 0.0f, 1.0f);
+                D2D1_RECT_F fill = tr; fill.right = tr.left + W(tr) * shown;
                 d.dc->FillRoundedRectangle(D2D1::RoundedRect(fill, trad, trad), d.accent);
             } else {
                 D2D1_RECT_F lr = D2D1::RectF(b.left + 44.0f * d.scale, b.top, b.right - 14.0f * d.scale, b.bottom);
@@ -2800,6 +2818,8 @@ DWORD WINAPI RenderThreadProc(void*) {
 
         // Apply queued state transitions (rebuild root).
         if (surface.ApplyPendingState(dc)) g_layoutDirty = true;
+        // Refresh the Open panel in place when the notification list changed.
+        if (surface.RebuildIfDataChanged(dc)) g_layoutDirty = true;
 
         // Measure + spring the window size.
         D2D1_SIZE_F content = surface.MeasureContent(dc);
@@ -2809,10 +2829,20 @@ DWORD WINAPI RenderThreadProc(void*) {
         auto frame = std::chrono::steady_clock::now();
         float dt = Clamp(std::chrono::duration<float>(frame - prevFrame).count(), 0.001f, 0.05f);
         prevFrame = frame;
-        float wStiff = content.width > wSpring.value ? 360.0f : 220.0f;
-        float hStiff = content.height > hSpring.value ? 360.0f : 220.0f;
-        wSpring.Step(dt, wStiff, 26.0f);
-        hSpring.Step(dt, hStiff, 26.0f);
+        // Smooth, near-critically-damped size morph (ratio ~0.98): a clean glide, no clunky bounce.
+        float wStiff = content.width > wSpring.value ? 300.0f : 260.0f;
+        float hStiff = content.height > hSpring.value ? 300.0f : 260.0f;
+        wSpring.Step(dt, wStiff, 34.0f);
+        hSpring.Step(dt, hStiff, 34.0f);
+
+        // Ease the displayed volume toward the real level so the popup bar animates (not static).
+        static float volDisplay = -1.0f;
+        float volTarget = g_volScalar.load();
+        if (volDisplay < 0.0f) volDisplay = volTarget;
+        volDisplay += (volTarget - volDisplay) * std::min(1.0f, dt * 14.0f);
+        if (std::fabs(volTarget - volDisplay) < 0.002f) volDisplay = volTarget;
+        g_volDisplayScalar = volDisplay;
+        bool volAnimating = (volDisplay != volTarget);
 
         bool widgetAnimating = surface.Tick(dt);
         bool sizeAnimating = !wSpring.AtRest() || !hSpring.AtRest();
@@ -2834,7 +2864,7 @@ DWORD WINAPI RenderThreadProc(void*) {
         static bool firstFrame = true;
         const int clockKey = ClockMinuteKey();
         bool active = widgetAnimating || sizeAnimating || surface.IsCapturing() ||
-                      mediaLive || privacyLive || inputActive;
+                      mediaLive || privacyLive || inputActive || volAnimating;
         bool needsRender = firstFrame || active || g_layoutDirty.load() ||
                            clockKey != lastClockKey || cursorInside != lastCursorInside;
         lastCursorInside = cursorInside;
