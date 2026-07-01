@@ -1111,6 +1111,10 @@ struct WeatherState {
     bool hasData = false;
     int temp = 0;
     int code = 0;
+    int feelsLike = 0;
+    int humidity = 0;
+    int windSpeed = 0;          // mph (Fahrenheit) or km/h (Celsius)
+    std::wstring windDir;       // 16-point compass, e.g. "SSW"
     std::wstring desc, city;
     double updated = 0.0;
 };
@@ -1169,6 +1173,10 @@ DWORD WINAPI WeatherThreadProc(void*) {
             w.temp = atoi((s.weatherFahrenheit ? tF : tC).c_str());
             w.code = atoi(code.c_str());
             w.desc = ics_detail::Utf8ToW(desc);
+            w.feelsLike = atoi(JsonStr(j, cc, s.weatherFahrenheit ? "FeelsLikeF" : "FeelsLikeC").c_str());
+            w.humidity = atoi(JsonStr(j, cc, "humidity").c_str());
+            w.windSpeed = atoi(JsonStr(j, cc, s.weatherFahrenheit ? "windspeedMiles" : "windspeedKmph").c_str());
+            w.windDir = ics_detail::Utf8ToW(JsonStr(j, cc, "winddir16Point"));
             size_t na = j.find("nearest_area");
             if (na != std::string::npos) { size_t ap = j.find("areaName", na); if (ap != std::string::npos) w.city = ics_detail::Utf8ToW(JsonStr(j, ap, "value")); }
             w.updated = NowSeconds();
@@ -2322,7 +2330,7 @@ class Surface {
         switch (state) {
             case SurfaceState::Collapsed:      return 180.0f * dc.scale;
             case SurfaceState::TransientPopup: return 230.0f * dc.scale;
-            case SurfaceState::Expanded:       return 320.0f * dc.scale;
+            case SurfaceState::Expanded:       return 360.0f * dc.scale;
             case SurfaceState::Open:           return 360.0f * dc.scale;
         }
         return 180.0f * dc.scale;
@@ -2390,6 +2398,44 @@ std::wstring WeatherShort() {
     if (!w.hasData) return L"";
     return WeatherGlyph(w.code) + L"  " + std::to_wstring(w.temp) + L"\x00B0";
 }
+// Secondary weather line for the hover peek: "Feels 83°   ·   Humidity 8%   ·   11 mph SSW".
+std::wstring WeatherDetail() {
+    WeatherState w = WeatherSnapshot();
+    if (!w.hasData) return L"";
+    std::wstring s = L"Feels " + std::to_wstring(w.feelsLike) + L"\x00B0";
+    s += L"    \x00B7    Humidity " + std::to_wstring(w.humidity) + L"%";
+    if (w.windSpeed > 0) {
+        s += L"    \x00B7    " + std::to_wstring(w.windSpeed) +
+             (SettingsSnapshot().weatherFahrenheit ? L" mph" : L" km/h");
+        if (!w.windDir.empty()) s += L" " + w.windDir;
+    }
+    return s;
+}
+// The next N not-yet-ended events across today + upcoming days, sorted by start time.
+// Cached (render thread only) by calendar generation + minute so it isn't recomputed
+// from the full ~289-event store on every measure/paint frame while hovering.
+std::vector<IcsEvent> NextUpcomingEvents(int maxN) {
+    static uint64_t cGen = (uint64_t)-1; static int cMin = -1; static int cN = -1;
+    static std::vector<IcsEvent> cache;
+    uint64_t gen = g_calGen.load(); int mk = ClockMinuteKey();
+    if (gen == cGen && mk == cMin && maxN == cN) return cache;
+    cGen = gen; cMin = mk; cN = maxN;
+    auto stamp = [](const SYSTEMTIME& st) {
+        FILETIME f{}; SystemTimeToFileTime(&st, &f);
+        ULARGE_INTEGER u; u.LowPart = f.dwLowDateTime; u.HighPart = f.dwHighDateTime; return u.QuadPart;
+    };
+    SYSTEMTIME nowSt; GetLocalTime(&nowSt);
+    unsigned long long nowU = stamp(nowSt);
+    std::vector<IcsEvent> out;
+    for (auto& e : CalendarSnapshot()) {
+        unsigned long long endU = stamp(e.end.wYear ? e.end : e.start);
+        if (endU > nowU) out.push_back(e);
+    }
+    std::sort(out.begin(), out.end(), [&](const IcsEvent& a, const IcsEvent& b) { return stamp(a.start) < stamp(b.start); });
+    if ((int)out.size() > maxN) out.resize(maxN);
+    cache = std::move(out);
+    return cache;
+}
 
 std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc) {
     if (s == SurfaceState::Collapsed) {
@@ -2456,25 +2502,60 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
 
     if (s == SurfaceState::Expanded) {
         auto v = std::make_unique<Custom>();
-        v->fixedHeight = 126.0f * dc.scale;
+        // Height grows to fit the weather detail line + the mini "Up next" list.
+        v->measure = [](const DrawContext& d, float) {
+            bool wf = WeatherFresh();
+            int n = (int)NextUpcomingEvents(3).size();
+            float h = 12.0f + 44.0f + 26.0f;      // pad + clock + date
+            if (wf) h += 26.0f + 22.0f;           // weather main + detail line
+            h += 10.0f + 1.0f + 10.0f + 20.0f;    // divider + "Up next" header
+            h += (n > 0 ? n * 24.0f : 22.0f);     // event rows or empty state
+            h += 12.0f;                           // bottom pad
+            return h * d.scale;
+        };
         v->paint = [](DrawContext& d, D2D1_RECT_F b) {
-            float rad = 22.0f * d.scale;
+            const float sc = d.scale;
+            float rad = 22.0f * sc;
             d.dc->FillRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.panel);
             d.dc->DrawRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.border, 1.0f);
-            // Centered clock + date.
-            D2D1_RECT_F clock = D2D1::RectF(b.left, b.top + 14.0f * d.scale, b.right, b.top + 58.0f * d.scale);
-            d.Text(TimeString(), d.fHuge, clock, d.text, 0.97f, DWRITE_TEXT_ALIGNMENT_CENTER);
-            D2D1_RECT_F date = D2D1::RectF(b.left, b.top + 58.0f * d.scale, b.right, b.top + 82.0f * d.scale);
-            d.Text(DateStringLong(), d.fBody, date, d.muted, 0.8f, DWRITE_TEXT_ALIGNMENT_CENTER);
-            // Prominent (expanded) weather: glyph + temperature + description, centered.
-            D2D1_RECT_F wr = D2D1::RectF(b.left, b.bottom - 36.0f * d.scale, b.right, b.bottom - 6.0f * d.scale);
+            float y = b.top + 12.0f * sc;
+            d.Text(TimeString(), d.fHuge, D2D1::RectF(b.left, y, b.right, y + 44 * sc), d.text, 0.97f, DWRITE_TEXT_ALIGNMENT_CENTER);
+            y += 44 * sc;
+            d.Text(DateStringLong(), d.fBody, D2D1::RectF(b.left, y, b.right, y + 22 * sc), d.muted, 0.8f, DWRITE_TEXT_ALIGNMENT_CENTER);
+            y += 26 * sc;
             if (WeatherFresh()) {
                 WeatherState w = WeatherSnapshot();
                 std::wstring line = WeatherShort() + (w.desc.empty() ? L"" : L"   " + w.desc);
-                d.Text(line, d.fTitle, wr, d.text, 0.92f, DWRITE_TEXT_ALIGNMENT_CENTER,
-                       DWRITE_PARAGRAPH_ALIGNMENT_CENTER, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                d.Text(line, d.fTitle, D2D1::RectF(b.left, y, b.right, y + 26 * sc), d.text, 0.92f,
+                       DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+                y += 26 * sc;
+                d.Text(WeatherDetail(), d.fSmall, D2D1::RectF(b.left, y, b.right, y + 18 * sc), d.muted, 0.7f, DWRITE_TEXT_ALIGNMENT_CENTER);
+                y += 22 * sc;
+            }
+            d.dc->FillRectangle(D2D1::RectF(b.left + 24 * sc, y + 5 * sc, b.right - 24 * sc, y + 6 * sc), d.divider);
+            y += 16 * sc;
+            d.Text(L"Up next", d.fSmall, D2D1::RectF(b.left + 20 * sc, y, b.right - 20 * sc, y + 16 * sc), d.muted, 0.55f);
+            y += 20 * sc;
+            auto evs = NextUpcomingEvents(3);
+            if (evs.empty()) {
+                d.Text(L"Nothing upcoming", d.fBody, D2D1::RectF(b.left, y, b.right, y + 22 * sc), d.muted, 0.5f, DWRITE_TEXT_ALIGNMENT_CENTER);
             } else {
-                d.Text(L"Click for controls", d.fSmall, wr, d.muted, 0.5f, DWRITE_TEXT_ALIGNMENT_CENTER);
+                SYSTEMTIME nowSt; GetLocalTime(&nowSt);
+                for (auto& e : evs) {
+                    bool sameDay = (e.start.wYear == nowSt.wYear && e.start.wMonth == nowSt.wMonth && e.start.wDay == nowSt.wDay);
+                    wchar_t tm[24] = {};
+                    if (e.allDay) wcscpy_s(tm, L"All day");
+                    else { SYSTEMTIME es = e.start; GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &es, nullptr, tm, ARRAYSIZE(tm)); }
+                    std::wstring when = tm;
+                    if (!sameDay) {  // prefix the weekday so tomorrow's times aren't mistaken for past ones
+                        wchar_t dd[16] = {}; GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &e.start, L"ddd", dd, ARRAYSIZE(dd), nullptr);
+                        when = std::wstring(dd) + L" " + tm;
+                    }
+                    d.dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(b.left + 20 * sc, y + 4 * sc, b.left + 22.5f * sc, y + 20 * sc), 1.2f * sc, 1.2f * sc), d.accent);
+                    d.Text(when, d.fSmall, D2D1::RectF(b.left + 30 * sc, y, b.left + 140 * sc, y + 22 * sc), d.muted, 0.8f);
+                    d.Text(e.subject, d.fBody, D2D1::RectF(b.left + 144 * sc, y, b.right - 16 * sc, y + 22 * sc), d.text, 0.92f);
+                    y += 24 * sc;
+                }
             }
         };
         return v;
