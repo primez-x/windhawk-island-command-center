@@ -2269,12 +2269,15 @@ class Surface {
         if (!root_) return;
         // Lay out at the LOCKED (settled) content size, centered in the animating inner rect, so
         // the tree never re-flows at intermediate morph sizes — it is simply revealed by the
-        // growing panel (the caller clips to inner). At rest inner == the locked size, so this is
-        // pixel-identical to a plain Layout(inner).
+        // growing panel (the caller clips to inner). SNAP the origin to whole device pixels and keep
+        // the width CONSTANT (lockedW_) so the clock/text glyphs keep the same sub-pixel phase every
+        // frame; a fractional, per-frame-shifting origin makes DirectWrite re-rasterize them, which
+        // reads as horizontal shimmer/blur during the morph. At rest inner == the locked size.
         float lw = lockedW_ > 0 ? lockedW_ : W(inner);
         float lh = lockedH_ > 0 ? lockedH_ : H(inner);
-        float cx = (inner.left + inner.right) * 0.5f;
-        root_->Layout(D2D1::RectF(cx - lw * 0.5f, inner.top, cx + lw * 0.5f, inner.top + lh));
+        float left = std::floor((inner.left + inner.right - lw) * 0.5f + 0.5f);
+        float top  = std::floor(inner.top + 0.5f);
+        root_->Layout(D2D1::RectF(left, top, left + lw, top + lh));
     }
     void Paint(DrawContext& dc) { if (root_) root_->Paint(dc); }
 
