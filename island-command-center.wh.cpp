@@ -5,7 +5,7 @@
 // @version         1.0.0
 // @author          Matt Pincoski
 // @include         island-host.exe
-// @compilerOptions -lole32 -loleaut32 -lshcore -ld2d1 -ldwrite -ldwmapi -lgdi32 -luser32 -lshell32 -lruntimeobject -lwindowscodecs -lavrt -lsetupapi -lwinhttp -lpdh -ldxva2 -ladvapi32
+// @compilerOptions -lole32 -loleaut32 -lshcore -ld2d1 -ldwrite -ldwmapi -lgdi32 -luser32 -lshell32 -lruntimeobject -lwindowscodecs -lavrt -lsetupapi -lwinhttp -lpdh -ldxva2 -ladvapi32 -lwinmm
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -95,6 +95,7 @@ network) and a clock mod / the Taskbar Styler (clock).
 
 #include <windows.h>
 #include <dwmapi.h>
+#include <timeapi.h>
 #include <shellapi.h>
 #include <d2d1.h>
 #include <dwrite.h>
@@ -1928,10 +1929,17 @@ class Renderer {
         bText_.Reset(); bMuted_.Reset(); bAccent_.Reset(); bPanel_.Reset(); bCard_.Reset();
         bBorder_.Reset(); bDivider_.Reset(); bTrack_.Reset();
         artBitmap_.Reset();
+        contentLayer_.Reset();
         target_.Reset(); dwriteFactory_.Reset(); d2dFactory_.Reset();
         if (oldBitmap_) { SelectObject(memDc_, oldBitmap_); oldBitmap_ = nullptr; }
         if (dib_) { DeleteObject(dib_); dib_ = nullptr; }
         if (memDc_) { DeleteDC(memDc_); memDc_ = nullptr; }
+    }
+
+    // Cached opacity layer for the content cross-fade during a morph (created lazily post-init).
+    ID2D1Layer* EnsureContentLayer() {
+        if (!contentLayer_ && target_) target_->CreateLayer(nullptr, &contentLayer_);
+        return contentLayer_.Get();
     }
 
     IDWriteFactory* DWrite() const { return dwriteFactory_.Get(); }
@@ -2085,6 +2093,7 @@ class Renderer {
     ComPtr<ID2D1Factory> d2dFactory_;
     ComPtr<IDWriteFactory> dwriteFactory_;
     ComPtr<ID2D1DCRenderTarget> target_;
+    ComPtr<ID2D1Layer> contentLayer_;
     ComPtr<IDWriteTextFormat> fHuge_, fTitle_, fBody_, fSmall_, fPill_, fGlyph_;
     ComPtr<ID2D1SolidColorBrush> bText_, bMuted_, bAccent_, bPanel_, bCard_, bBorder_, bDivider_, bTrack_;
     ComPtr<ID2D1Bitmap> artBitmap_;
@@ -2251,9 +2260,21 @@ class Surface {
         return D2D1::SizeF(width, height);
     }
 
+    void SetLocked(D2D1_SIZE_F sz) { lockedW_ = sz.width; lockedH_ = sz.height; }
+    float LockedW() const { return lockedW_; }
+    float LockedH() const { return lockedH_; }
+
     void Layout(const DrawContext& dc, D2D1_RECT_F inner) {
         SetLayoutDc(root_.get(), &dc);
-        if (root_) root_->Layout(inner);
+        if (!root_) return;
+        // Lay out at the LOCKED (settled) content size, centered in the animating inner rect, so
+        // the tree never re-flows at intermediate morph sizes — it is simply revealed by the
+        // growing panel (the caller clips to inner). At rest inner == the locked size, so this is
+        // pixel-identical to a plain Layout(inner).
+        float lw = lockedW_ > 0 ? lockedW_ : W(inner);
+        float lh = lockedH_ > 0 ? lockedH_ : H(inner);
+        float cx = (inner.left + inner.right) * 0.5f;
+        root_->Layout(D2D1::RectF(cx - lw * 0.5f, inner.top, cx + lw * 0.5f, inner.top + lh));
     }
     void Paint(DrawContext& dc) { if (root_) root_->Paint(dc); }
 
@@ -2378,6 +2399,7 @@ class Surface {
     std::optional<SurfaceState> pendingState_;
     double lastHoverTime_ = 0.0;
     uint64_t builtNotifGen_ = 0;
+    float lockedW_ = 0.0f, lockedH_ = 0.0f;  // frozen target size during a morph
 };
 
 // ---- formatting helpers ----
@@ -2460,9 +2482,6 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
             return 22.0f * d.scale + wt + 26.0f * d.scale + wr + 22.0f * d.scale;
         };
         pill->paint = [](DrawContext& d, D2D1_RECT_F b) {
-            float rad = H(b) * 0.5f;
-            d.dc->FillRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.panel);
-            d.dc->DrawRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.border, 1.0f);
             float midX = (b.left + b.right) * 0.5f;
             D2D1_RECT_F tr = D2D1::RectF(b.left + 14.0f * d.scale, b.top, midX - 4.0f * d.scale, b.bottom);
             D2D1_RECT_F dr = D2D1::RectF(midX + 4.0f * d.scale, b.top, b.right - 14.0f * d.scale, b.bottom);
@@ -2488,9 +2507,6 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
         };
         v->paint = [](DrawContext& d, D2D1_RECT_F b) {
             Transient t = TransientSnapshot();
-            float rad = H(b) * 0.5f;
-            d.dc->FillRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.panel);
-            d.dc->DrawRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.border, 1.0f);
             D2D1_RECT_F gr = D2D1::RectF(b.left + 14.0f * d.scale, b.top, b.left + 40.0f * d.scale, b.bottom);
             d.Text(t.glyph, d.fGlyph ? d.fGlyph : d.fPill, gr, d.accent, 0.95f, DWRITE_TEXT_ALIGNMENT_CENTER);
             if (t.kind == 2) {  // volume: label + bar + percent
@@ -2527,9 +2543,6 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
         };
         v->paint = [](DrawContext& d, D2D1_RECT_F b) {
             const float sc = d.scale;
-            float rad = 22.0f * sc;
-            d.dc->FillRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.panel);
-            d.dc->DrawRoundedRectangle(D2D1::RoundedRect(b, rad, rad), d.border, 1.0f);
             float y = b.top + 12.0f * sc;
             d.Text(TimeString(), d.fHuge, D2D1::RectF(b.left, y, b.right, y + 44 * sc), d.text, 0.97f, DWRITE_TEXT_ALIGNMENT_CENTER);
             y += 44 * sc;
@@ -2573,10 +2586,10 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
         return v;
     }
 
-    // Open: full control center.
+    // Open: full control center. (The rounded panel backdrop is drawn once by the render loop at
+    // the animating size; the content tree is transparent so the morph reveal/clip stays clean.)
     auto panel = std::make_unique<StackPanel>();
     panel->padX = 16.0f; panel->padY = 14.0f; panel->gap = 10.0f;
-    panel->drawBg = true;  // rounded panel backdrop behind the whole control center
 
     // Header: big clock + long date (custom).
     auto header = std::make_unique<Custom>();
@@ -2872,6 +2885,9 @@ DWORD WINAPI RenderThreadProc(void*) {
     hSpring.Reset(40.0f);
     auto prevFrame = std::chrono::steady_clock::now();
     double nextVolPoll = 0.0;
+    bool hiRes = false;                                   // 1ms timer resolution raised only while active
+    auto nextDeadline = std::chrono::steady_clock::now();  // absolute 60fps pacing deadline
+    float morphStartH = 40.0f;                             // panel height at the current morph's start
 
     while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
         MSG msg = {};
@@ -2909,24 +2925,46 @@ DWORD WINAPI RenderThreadProc(void*) {
         // Flush any pending slider drag with correct scale.
         surface.FlushPendingDrag(dc);
 
-        // Apply queued state transitions (rebuild root).
-        if (surface.ApplyPendingState(dc)) g_layoutDirty = true;
-        // Refresh the Open panel in place when the notification list changed.
-        if (surface.RebuildIfDataChanged(dc)) g_layoutDirty = true;
+        // Apply queued state transitions (rebuild root) / in-place data refresh.
+        bool stateChanged = surface.ApplyPendingState(dc);
+        if (stateChanged) g_layoutDirty = true;
+        bool dataChanged = surface.RebuildIfDataChanged(dc);  // e.g. notif list changed while Open
+        if (dataChanged) g_layoutDirty = true;
 
-        // Measure + spring the window size.
-        D2D1_SIZE_F content = surface.MeasureContent(dc);
-        wSpring.target = content.width;
-        hSpring.target = content.height;
+        // Target-LOCK + content-fade clock. Re-measure the content size only on a real change
+        // (state transition / data refresh) or when SETTLED, then FREEZE it for the whole morph —
+        // per-frame re-measure (dynamic Expanded height, Open's MaxOpenHeight clamp) is what
+        // re-aimed the spring mid-flight and made the size non-monotonic/choppy. On a state
+        // transition, record the start height so content fades in as the panel grows (otherwise the
+        // new state's big content would flash clipped inside the still-small pill — the "hitch").
+        bool settledNow = wSpring.AtRest() && hSpring.AtRest();
+        if (stateChanged || dataChanged || settledNow) {
+            D2D1_SIZE_F m = surface.MeasureContent(dc);
+            if (stateChanged)      morphStartH = hSpring.value;  // fade content in over the grow
+            else if (dataChanged)  morphStartH = m.height;       // resize only, no content fade
+            surface.SetLocked(m);
+        }
+        wSpring.target = surface.LockedW();
+        hSpring.target = surface.LockedH();
 
         auto frame = std::chrono::steady_clock::now();
-        float dt = Clamp(std::chrono::duration<float>(frame - prevFrame).count(), 0.001f, 0.05f);
+        float dt = Clamp(std::chrono::duration<float>(frame - prevFrame).count(), 0.001f, 0.033f);
         prevFrame = frame;
-        // Smooth, near-critically-damped size morph (ratio ~0.98): a clean glide, no clunky bounce.
-        float wStiff = content.width > wSpring.value ? 300.0f : 260.0f;
-        float hStiff = content.height > hSpring.value ? 300.0f : 260.0f;
-        wSpring.Step(dt, wStiff, 34.0f);
-        hSpring.Step(dt, hStiff, 34.0f);
+        // A morph begins right after an idle sleep, so this first dt spans the whole idle gap
+        // (~100ms). Feeding that to a stiff spring makes it lurch most of the way in ONE step — an
+        // instant, hitchy morph. Begin every transition with a normal 60fps step instead.
+        if (stateChanged) dt = 1.0f / 60.0f;
+        // Slightly over-damped (zeta ~1.03): a smooth, strictly monotonic glide, no bounce.
+        wSpring.Step(dt, 320.0f, 37.0f);
+        hSpring.Step(dt, 320.0f, 37.0f);
+
+        // Content-fade progress: 0 at the panel's morph-start size -> 1 at its locked target. Kept
+        // low early so the incoming content isn't drawn (clipped) while the panel is still small.
+        float span = surface.LockedH() - morphStartH;
+        float t01 = (std::fabs(span) < 1.0f) ? 1.0f
+                    : Clamp((hSpring.value - morphStartH) / span, 0.0f, 1.0f);
+        float tb = Clamp((t01 - 0.28f) / 0.72f, 0.0f, 1.0f);
+        float contentAlpha = tb * tb * (3.0f - 2.0f * tb);  // smoothstep, delayed
 
         // Ease the displayed volume toward the real level so the popup bar animates (not static).
         static float volDisplay = -1.0f;
@@ -2971,8 +3009,31 @@ DWORD WINAPI RenderThreadProc(void*) {
                 DrawContext pdc = renderer.MakeContext(scale, now);  // brushes valid post-BindDC
                 pdc.artBmp = renderer.ArtBitmap(mediaNow.art.gen, mediaNow.art.w, mediaNow.art.h, mediaNow.art.bgra);
                 BindGlyphFormats(surface, renderer.GlyphFormat());
+                // Draw the gliding rounded panel ONCE (pill when short, rounded-rect when tall).
+                // Content is laid out at the locked size and clipped to this animating rect, so it
+                // is revealed as the panel grows instead of re-flowing / popping in.
+                {
+                    float pr = std::min(H(inner) * 0.5f, 22.0f * scale);
+                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(inner, pr, pr);
+                    pdc.dc->FillRoundedRectangle(rr, pdc.panel);
+                    pdc.dc->DrawRoundedRectangle(rr, pdc.border, 1.0f);
+                }
                 surface.Layout(pdc, inner);
-                surface.Paint(pdc);
+                // Content is clipped to the animating panel. During a morph (contentAlpha < 1) we
+                // fade it in through an opacity LAYER so the incoming big content never shows at
+                // full alpha while clipped in the small pill; at rest a plain clip is used (cheaper).
+                ID2D1Layer* clyr = contentAlpha < 0.995f ? renderer.EnsureContentLayer() : nullptr;
+                if (clyr) {
+                    pdc.dc->PushLayer(D2D1::LayerParameters(inner, nullptr,
+                        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::Matrix3x2F::Identity(),
+                        contentAlpha), clyr);
+                    surface.Paint(pdc);
+                    pdc.dc->PopLayer();
+                } else {
+                    pdc.dc->PushAxisAlignedClip(inner, D2D1_ANTIALIAS_MODE_ALIASED);
+                    surface.Paint(pdc);
+                    pdc.dc->PopAxisAlignedClip();
+                }
                 // Privacy dots overlay (camera = green, mic = orange), pulsing, top-right.
                 if (g_micActive.load() || g_camActive.load()) {
                     float pr = 3.5f * scale, px = inner.right - 12.0f * scale, py = inner.top + 11.0f * scale;
@@ -2997,10 +3058,25 @@ DWORD WINAPI RenderThreadProc(void*) {
         bool wantInteractive = (surface.state == SurfaceState::Open) || cursorInside || surface.IsCapturing();
         SetClickThrough(hwnd, !wantInteractive);
 
-        // 60fps while something is live; otherwise idle-poll for hover/clock without repainting.
-        WaitForSingleObject(g_stopEvent, active ? 16 : 100);
+        // Frame pacing. While active, hold true 60fps with a 1ms timer resolution and an ABSOLUTE
+        // deadline (paint time is absorbed into the budget, not added on top) — this removes the
+        // ~15.6ms quantization / duplicate frames that made the morph steppy. Idle -> drop the
+        // resolution (power) and poll slowly for hover/clock.
+        if (active) {
+            if (!hiRes) { timeBeginPeriod(1); hiRes = true; }
+            nextDeadline += std::chrono::microseconds(16667);
+            auto nowc = std::chrono::steady_clock::now();
+            double waitMs = std::chrono::duration<double, std::milli>(nextDeadline - nowc).count();
+            if (waitMs < 0.0) { nextDeadline = nowc; waitMs = 0.0; }  // fell behind -> rebase, no spiral
+            WaitForSingleObject(g_stopEvent, (DWORD)(waitMs + 0.5));
+        } else {
+            if (hiRes) { timeEndPeriod(1); hiRes = false; }
+            nextDeadline = std::chrono::steady_clock::now();
+            WaitForSingleObject(g_stopEvent, 100);
+        }
     }
 
+    if (hiRes) timeEndPeriod(1);
     g_surface = nullptr;
     RemoveDismissHook();
     renderer.Shutdown();
