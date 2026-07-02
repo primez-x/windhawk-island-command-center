@@ -2428,6 +2428,13 @@ std::wstring DateStringShort() {
     GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"ddd, MMM d", buf, ARRAYSIZE(buf), nullptr);
     return buf;
 }
+// Compact weekday + numeric date for the collapsed pill, e.g. "Wed 7/2" (no year).
+std::wstring DatePillString() {
+    SYSTEMTIME t; GetLocalTime(&t);
+    wchar_t buf[32] = {};
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"ddd M/d", buf, ARRAYSIZE(buf), nullptr);
+    return buf;
+}
 std::wstring DateStringLong() {
     SYSTEMTIME t; GetLocalTime(&t);
     wchar_t buf[96] = {};
@@ -2483,24 +2490,36 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
     if (s == SurfaceState::Collapsed) {
         auto pill = std::make_unique<Custom>();
         pill->fixedHeight = 40.0f * dc.scale;
+        // time | date  weather  — measured left-to-right so the pill sizes to fit exactly.
         pill->prefWidth = [](const DrawContext& d) {
-            std::wstring right = WeatherFresh() ? WeatherShort() : DateStringShort();
-            float wt = d.MeasureWidth(d.fPill, TimeString());
-            float wr = d.MeasureWidth(d.fPill, right);
-            return 22.0f * d.scale + wt + 26.0f * d.scale + wr + 22.0f * d.scale;
+            const float s = d.scale;
+            float total = 16.0f * s + d.MeasureWidth(d.fPill, TimeString())
+                        + 11.0f * s + 1.2f * s + 11.0f * s
+                        + d.MeasureWidth(d.fPill, DatePillString());
+            if (WeatherFresh()) total += 14.0f * s + d.MeasureWidth(d.fPill, WeatherShort());
+            return total + 16.0f * s;
         };
         pill->paint = [](DrawContext& d, D2D1_RECT_F b) {
-            float midX = (b.left + b.right) * 0.5f;
-            D2D1_RECT_F tr = D2D1::RectF(b.left + 14.0f * d.scale, b.top, midX - 4.0f * d.scale, b.bottom);
-            D2D1_RECT_F dr = D2D1::RectF(midX + 4.0f * d.scale, b.top, b.right - 14.0f * d.scale, b.bottom);
-            d.Text(TimeString(), d.fPill, tr, d.text, 0.96f);
-            d.dc->FillRectangle(D2D1::RectF(midX - 0.6f * d.scale, b.top + 11.0f * d.scale,
-                                            midX + 0.6f * d.scale, b.bottom - 11.0f * d.scale), d.divider);
-            if (WeatherFresh())
-                d.Text(WeatherShort(), d.fPill, dr, d.text, 0.92f, DWRITE_TEXT_ALIGNMENT_CENTER,
-                       DWRITE_PARAGRAPH_ALIGNMENT_CENTER, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-            else
-                d.Text(DateStringShort(), d.fPill, dr, d.muted, 0.85f);
+            const float s = d.scale;
+            float x = b.left + 16.0f * s;
+            std::wstring tm = TimeString();
+            float tw = d.MeasureWidth(d.fPill, tm);
+            d.Text(tm, d.fPill, D2D1::RectF(x, b.top, x + tw, b.bottom), d.text, 0.96f);
+            x += tw + 11.0f * s;
+            d.dc->FillRectangle(D2D1::RectF(x, b.top + 11.0f * s, x + 1.2f * s, b.bottom - 11.0f * s), d.divider);
+            x += 1.2f * s + 11.0f * s;
+            std::wstring dt = DatePillString();
+            float dw = d.MeasureWidth(d.fPill, dt);
+            d.Text(dt, d.fPill, D2D1::RectF(x, b.top, x + dw, b.bottom), d.muted, 0.85f);
+            x += dw;
+            if (WeatherFresh()) {
+                x += 14.0f * s;
+                std::wstring w = WeatherShort();
+                float ww = d.MeasureWidth(d.fPill, w);
+                d.Text(w, d.fPill, D2D1::RectF(x, b.top, x + ww, b.bottom), d.text, 0.92f,
+                       DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                       D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            }
         };
         return pill;
     }
@@ -3045,19 +3064,27 @@ DWORD WINAPI RenderThreadProc(void*) {
                     surface.Paint(pdc);
                     pdc.dc->PopAxisAlignedClip();
                 }
-                // Privacy dots overlay (camera = green, mic = orange), pulsing, top-right of the panel.
-                if (g_micActive.load() || g_camActive.load()) {
-                    float pr = 3.5f * scale, px = panelR.right - 12.0f * scale, py = panelR.top + 11.0f * scale;
-                    float pulse = 0.55f + 0.45f * sinf((float)now * 4.0f);
-                    if (g_camActive.load()) {
-                        ComPtr<ID2D1SolidColorBrush> b;
-                        pdc.dc->CreateSolidColorBrush(D2D1::ColorF(0.2f, 0.85f, 0.35f, pulse), &b);
-                        if (b) { pdc.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(px, py), pr, pr), b.Get()); px -= 12.0f * scale; }
-                    }
-                    if (g_micActive.load()) {
-                        ComPtr<ID2D1SolidColorBrush> b;
-                        pdc.dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.6f, 0.1f, pulse), &b);
-                        if (b) pdc.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(px, py), pr, pr), b.Get());
+                // Privacy dots (camera = green, mic = orange), pulsing, centered at the top of the panel.
+                {
+                    bool cam = g_camActive.load(), mic = g_micActive.load();
+                    int count = (cam ? 1 : 0) + (mic ? 1 : 0);
+                    if (count > 0) {
+                        float pr = 3.0f * scale, gap = 12.0f * scale;
+                        float cxD = (panelR.left + panelR.right) * 0.5f;
+                        float py = panelR.top + 7.0f * scale;
+                        float px = cxD - (count - 1) * gap * 0.5f;
+                        float pulse = 0.55f + 0.45f * sinf((float)now * 4.0f);
+                        if (cam) {
+                            ComPtr<ID2D1SolidColorBrush> bb;
+                            pdc.dc->CreateSolidColorBrush(D2D1::ColorF(0.2f, 0.85f, 0.35f, pulse), &bb);
+                            if (bb) pdc.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(px, py), pr, pr), bb.Get());
+                            px += gap;
+                        }
+                        if (mic) {
+                            ComPtr<ID2D1SolidColorBrush> bb;
+                            pdc.dc->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.6f, 0.1f, pulse), &bb);
+                            if (bb) pdc.dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(px, py), pr, pr), bb.Get());
+                        }
                     }
                 }
                 renderer.EndFrame(s);
