@@ -635,6 +635,7 @@ std::atomic<bool>  g_volValid{false};
 double g_volSuppressPollUntil = 0.0;  // render-thread only
 
 HWND g_hwnd = nullptr;
+RECT g_pillRect = {};  // screen rect of the VISIBLE panel (not the window) — drives hover detection
 HANDLE g_stopEvent = nullptr;
 HANDLE g_renderThread = nullptr;
 HANDLE g_notifThread = nullptr;
@@ -2238,6 +2239,17 @@ class Surface {
         captureTarget_ = nullptr;
         pressTarget_ = nullptr;
         builtNotifGen_ = g_notifGen.load();  // snapshot the notif list version this tree was built from
+        builtScale_ = dc.scale;
+    }
+
+    // The initial BuildFor(Collapsed, ...) at startup uses a placeholder scale of 1.0 (no real
+    // window/DPI yet). If the surface never transitions state before the real per-monitor scale is
+    // known, sizes baked into the tree (e.g. Custom::fixedHeight, captured by value at build time)
+    // stay wrong forever. Call this every frame; it rebuilds the CURRENT state at the real scale the
+    // first time they differ (and again on any later DPI/SizeScale change).
+    bool RebuildIfScaleChanged(const DrawContext& dc) {
+        if (std::fabs(dc.scale - builtScale_) > 0.001f) { BuildFor(state, dc); return true; }
+        return false;
     }
 
     // The Open panel's notification rows are baked at build time; when the list changes
@@ -2408,6 +2420,7 @@ class Surface {
     double lastHoverTime_ = 0.0;
     uint64_t builtNotifGen_ = 0;
     float lockedW_ = 0.0f, lockedH_ = 0.0f;  // frozen target size during a morph
+    float builtScale_ = -1.0f;  // scale the current root_ was built at; -1 forces the first real rebuild
 };
 
 // ---- formatting helpers ----
@@ -2489,31 +2502,30 @@ std::vector<IcsEvent> NextUpcomingEvents(int maxN) {
 std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc) {
     if (s == SurfaceState::Collapsed) {
         auto pill = std::make_unique<Custom>();
-        pill->fixedHeight = 40.0f * dc.scale;
-        // time | date  weather  — measured left-to-right so the pill sizes to fit exactly.
+        pill->fixedHeight = 50.0f * dc.scale;
+        // [ time / date ]  |  weather  — time is the hero with the date as small sub-text beneath.
         pill->prefWidth = [](const DrawContext& d) {
             const float s = d.scale;
-            float total = 16.0f * s + d.MeasureWidth(d.fPill, TimeString())
-                        + 11.0f * s + 1.2f * s + 11.0f * s
-                        + d.MeasureWidth(d.fPill, DatePillString());
-            if (WeatherFresh()) total += 14.0f * s + d.MeasureWidth(d.fPill, WeatherShort());
+            float leftW = std::max(d.MeasureWidth(d.fPill, TimeString()),
+                                   d.MeasureWidth(d.fSmall, DatePillString()));
+            float total = 16.0f * s + leftW;
+            if (WeatherFresh())
+                total += 12.0f * s + 1.2f * s + 12.0f * s + d.MeasureWidth(d.fPill, WeatherShort());
             return total + 16.0f * s;
         };
         pill->paint = [](DrawContext& d, D2D1_RECT_F b) {
             const float s = d.scale;
-            float x = b.left + 16.0f * s;
-            std::wstring tm = TimeString();
-            float tw = d.MeasureWidth(d.fPill, tm);
-            d.Text(tm, d.fPill, D2D1::RectF(x, b.top, x + tw, b.bottom), d.text, 0.96f);
-            x += tw + 11.0f * s;
-            d.dc->FillRectangle(D2D1::RectF(x, b.top + 11.0f * s, x + 1.2f * s, b.bottom - 11.0f * s), d.divider);
-            x += 1.2f * s + 11.0f * s;
-            std::wstring dt = DatePillString();
-            float dw = d.MeasureWidth(d.fPill, dt);
-            d.Text(dt, d.fPill, D2D1::RectF(x, b.top, x + dw, b.bottom), d.muted, 0.85f);
-            x += dw;
+            float leftW = std::max(d.MeasureWidth(d.fPill, TimeString()),
+                                   d.MeasureWidth(d.fSmall, DatePillString()));
+            float lx = b.left + 16.0f * s;
+            d.Text(TimeString(), d.fPill, D2D1::RectF(lx, b.top + 9.0f * s, lx + leftW, b.top + 32.0f * s),
+                   d.text, 0.96f, DWRITE_TEXT_ALIGNMENT_CENTER);
+            d.Text(DatePillString(), d.fSmall, D2D1::RectF(lx, b.top + 31.0f * s, lx + leftW, b.top + 47.0f * s),
+                   d.muted, 0.8f, DWRITE_TEXT_ALIGNMENT_CENTER);
             if (WeatherFresh()) {
-                x += 14.0f * s;
+                float x = lx + leftW + 12.0f * s;
+                d.dc->FillRectangle(D2D1::RectF(x, b.top + 13.0f * s, x + 1.2f * s, b.bottom - 13.0f * s), d.divider);
+                x += 1.2f * s + 12.0f * s;
                 std::wstring w = WeatherShort();
                 float ww = d.MeasureWidth(d.fPill, w);
                 d.Text(w, d.fPill, D2D1::RectF(x, b.top, x + ww, b.bottom), d.text, 0.92f,
@@ -2943,10 +2955,17 @@ DWORD WINAPI RenderThreadProc(void*) {
 
         DrawContext dc = renderer.MakeContext(scale, now);
 
-        // Hover state (geometric, like the donor — works even when click-through).
+        // The startup BuildFor(Collapsed, ...) used a placeholder scale (no real DPI yet); rebuild
+        // at the real scale the first time they differ (and again on any later DPI/SizeScale change)
+        // so sizes baked into the tree (e.g. the pill's fixedHeight) are never wrong.
+        if (surface.RebuildIfScaleChanged(dc)) g_layoutDirty = true;
+
+        // Hover state (geometric). Use the VISIBLE panel rect, not the window rect: since the window
+        // is held at the (larger) stable size during a morph, keying hover off the window would make
+        // the empty area where the expanded panel *would* be trigger the expand. g_pillRect is the
+        // actual drawn panel from the last frame (screen coords).
         POINT cur; GetCursorPos(&cur);
-        RECT win; GetWindowRect(hwnd, &win);
-        bool cursorInside = PtInRect(&win, cur) != FALSE;
+        bool cursorInside = PtInRect(&g_pillRect, cur) != FALSE;
         surface.UpdateAmbientState(cursorInside, now);
 
         // Flush any pending slider drag with correct scale.
@@ -3042,6 +3061,10 @@ DWORD WINAPI RenderThreadProc(void*) {
                 float aw = std::min((float)cw, W(inner)), ah = std::min((float)ch, H(inner));
                 float panelLeft = std::floor((inner.left + inner.right - aw) * 0.5f + 0.5f);
                 D2D1_RECT_F panelR = D2D1::RectF(panelLeft, inner.top, panelLeft + aw, inner.top + ah);
+                // Publish the visible panel's screen rect for next frame's hover test.
+                { RECT wr; GetWindowRect(hwnd, &wr);
+                  g_pillRect = { wr.left + (LONG)panelR.left, wr.top + (LONG)panelR.top,
+                                 wr.left + (LONG)panelR.right, wr.top + (LONG)panelR.bottom }; }
                 {
                     float pr = std::min(H(panelR) * 0.5f, 22.0f * scale);
                     D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(panelR, pr, pr);
@@ -3069,9 +3092,9 @@ DWORD WINAPI RenderThreadProc(void*) {
                     bool cam = g_camActive.load(), mic = g_micActive.load();
                     int count = (cam ? 1 : 0) + (mic ? 1 : 0);
                     if (count > 0) {
-                        float pr = 3.0f * scale, gap = 12.0f * scale;
+                        float pr = 2.5f * scale, gap = 11.0f * scale;
                         float cxD = (panelR.left + panelR.right) * 0.5f;
-                        float py = panelR.top + 7.0f * scale;
+                        float py = panelR.top + 5.5f * scale;
                         float px = cxD - (count - 1) * gap * 0.5f;
                         float pulse = 0.55f + 0.45f * sinf((float)now * 4.0f);
                         if (cam) {
