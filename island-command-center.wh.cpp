@@ -58,7 +58,18 @@ network) and a clock mod / the Taskbar Styler (clock).
   $name: Always on top
 - PillOpacity: "1.0"
   $name: Pill opacity
-  $description: 0.35 - 1.0.
+  $description: 0.35 - 1.0. Fades the WHOLE island; independent of Backdrop style.
+- BackdropStyle: None
+  $name: Backdrop style
+  $options:
+  - None: None (solid panel)
+  - Translucent: Translucent
+  - Glass: Glass
+  - Frosted: Frosted
+  - Acrylic: Acrylic
+  $description: >-
+    Adds real Windows blur-behind under the panel, tinted per style. Windows
+    gives one blur strength, so styles differ by tint/opacity, not blur amount.
 - CalendarIcsUrl: ""
   $name: Calendar ICS URL
   $description: >-
@@ -558,6 +569,21 @@ inline std::vector<IcsEvent> ParseIcsEvents(const std::string& icsUtf8, const SY
 // ---------------------------------------------------------------------------
 enum class Position { TopCenter, TopLeft, TopRight, BottomCenter };
 
+// Backdrop blur presets. Windows' DWM blur-behind gives one fixed blur strength (no per-preset
+// BlurAmount dial), so these differ by TINT COLOR + OPACITY of the panel fill drawn over that
+// blur — None keeps today's solid panel with no blur at all.
+enum class BackdropStyle { None, Translucent, Glass, Frosted, Acrylic };
+struct BackdropPreset { bool blur; float r, g, b, a; };
+BackdropPreset PresetFor(BackdropStyle s) {
+    switch (s) {
+        case BackdropStyle::Translucent: return {true, 0.45f, 0.45f, 0.47f, 0.40f};  // light tint, blur does most of the work
+        case BackdropStyle::Glass:       return {true, 0.25f, 0.26f, 0.29f, 0.55f};  // cool gray glass
+        case BackdropStyle::Frosted:     return {true, 0.45f, 0.45f, 0.47f, 0.62f};  // lighter/whiter, denser diffusion
+        case BackdropStyle::Acrylic:     return {true, 0.09f, 0.09f, 0.11f, 0.82f};  // near-opaque dark, blur only at the edges
+        default:                         return {false, 0.043f, 0.043f, 0.051f, 0.94f};  // None: today's solid panel
+    }
+}
+
 struct Settings {
     Position position = Position::TopCenter;
     int targetMonitor = 0;
@@ -567,6 +593,7 @@ struct Settings {
     bool autoDpiScale = true;
     bool alwaysOnTop = true;
     float pillOpacity = 1.0f;
+    BackdropStyle backdropStyle = BackdropStyle::None;
     std::wstring calendarIcsUrl;
     int calendarRefreshMinutes = 20;
     bool brightnessEnabled = true;
@@ -597,6 +624,12 @@ void LoadSettings() {
     next.alwaysOnTop = Wh_GetIntSetting(L"AlwaysOnTop") != 0;
     const std::wstring opacity = GetStringSettingCopy(L"PillOpacity");
     next.pillOpacity = opacity.empty() ? 1.0f : Clamp(static_cast<float>(_wtof(opacity.c_str())), 0.35f, 1.0f);
+    const std::wstring backdrop = GetStringSettingCopy(L"BackdropStyle");
+    if (EqualsNoCase(backdrop, L"Translucent")) next.backdropStyle = BackdropStyle::Translucent;
+    else if (EqualsNoCase(backdrop, L"Glass")) next.backdropStyle = BackdropStyle::Glass;
+    else if (EqualsNoCase(backdrop, L"Frosted")) next.backdropStyle = BackdropStyle::Frosted;
+    else if (EqualsNoCase(backdrop, L"Acrylic")) next.backdropStyle = BackdropStyle::Acrylic;
+    else next.backdropStyle = BackdropStyle::None;
     next.calendarIcsUrl = GetStringSettingCopy(L"CalendarIcsUrl");
     next.calendarRefreshMinutes = ClampInt(Wh_GetIntSetting(L"CalendarRefreshMinutes"), 5, 240);
     next.brightnessEnabled = Wh_GetIntSetting(L"BrightnessEnabled") != 0;
@@ -2009,6 +2042,9 @@ class Renderer {
         RECT rc = {0, 0, bitmapWidth_, bitmapHeight_};
         if (FAILED(target_->BindDC(memDc_, &rc))) return false;
         EnsureBrushes();  // device-dependent: must be created after BindDC
+        BackdropPreset preset = PresetFor(settings.backdropStyle);
+        if (bPanel_) bPanel_->SetColor(D2D1::ColorF(preset.r, preset.g, preset.b, preset.a));
+        wantBlur_ = preset.blur;
         target_->BeginDraw();
         target_->Clear(D2D1::ColorF(0, 0.0f));
         innerOut = D2D1::RectF(padX, padY, (float)bitmapWidth_ - padX, (float)bitmapHeight_ - padY);
@@ -2025,6 +2061,38 @@ class Renderer {
         blend.SourceConstantAlpha = static_cast<BYTE>(Clamp(settings.pillOpacity, 0.35f, 1.0f) * 255.0f);
         blend.AlphaFormat = AC_SRC_ALPHA;
         return UpdateLayeredWindow(hwnd_, nullptr, &dst, &size, memDc_, &src, 0, &blend, ULW_ALPHA) != FALSE;
+    }
+
+    bool WantsBlur() const { return wantBlur_; }
+
+    // Real Windows blur-behind (DwmEnableBlurBehindWindow), scoped to the panel's rounded-rect
+    // shape so only that region blurs the desktop/app behind it. `panelRect` is in window-client
+    // pixels (same space as everything drawn into the DIB) and `cornerRadius` must match what's
+    // used to draw the panel itself, or the blurred region and the visible rounded shape won't align.
+    // Skips the DWM call when nothing changed (enable state or rect) — cheap to poll every frame.
+    void UpdateBackdropBlur(bool enable, D2D1_RECT_F panelRect, float cornerRadius) {
+        RECT r = {(LONG)std::floor(panelRect.left), (LONG)std::floor(panelRect.top),
+                  (LONG)std::ceil(panelRect.right), (LONG)std::ceil(panelRect.bottom)};
+        bool rectChanged = r.left != blurRect_.left || r.top != blurRect_.top ||
+                            r.right != blurRect_.right || r.bottom != blurRect_.bottom;
+        if (enable == blurEnabled_ && (!enable || !rectChanged)) return;
+        blurEnabled_ = enable;
+        blurRect_ = r;
+        DWM_BLURBEHIND bb = {};
+        if (enable) {
+            int diam = std::max(1, (int)std::lround(cornerRadius * 2.0f));
+            HRGN rgn = CreateRoundRectRgn(r.left, r.top, std::max(r.left + 1, r.right),
+                                          std::max(r.top + 1, r.bottom), diam, diam);
+            bb.dwFlags = DWM_BB_ENABLE | DWM_BB_BLURREGION;
+            bb.fEnable = TRUE;
+            bb.hRgnBlur = rgn;
+            DwmEnableBlurBehindWindow(hwnd_, &bb);
+            if (rgn) DeleteObject(rgn);  // DWM copies the region; safe to delete immediately after
+        } else {
+            bb.dwFlags = DWM_BB_ENABLE;
+            bb.fEnable = FALSE;
+            DwmEnableBlurBehindWindow(hwnd_, &bb);
+        }
     }
 
     void DrawPanelSurface(D2D1_RECT_F inner) {
@@ -2118,6 +2186,9 @@ class Renderer {
     int bitmapWidth_ = 0, bitmapHeight_ = 0;   // allocated DIB size (may exceed the presented size)
     int presentW_ = 0, presentH_ = 0;          // size actually shown via UpdateLayeredWindow
     float lastScale_ = 0.0f;
+    bool wantBlur_ = false;                    // current BackdropStyle wants DWM blur-behind
+    bool blurEnabled_ = false;                 // last-applied DWM blur-behind state (dedupe calls)
+    RECT blurRect_ = {-1, -1, -1, -1};          // last-applied blur region, window-client pixels
 };
 
 // ---------------------------------------------------------------------------
@@ -3084,12 +3155,14 @@ DWORD WINAPI RenderThreadProc(void*) {
                 { RECT wr; GetWindowRect(hwnd, &wr);
                   g_pillRect = { wr.left + (LONG)panelR.left, wr.top + (LONG)panelR.top,
                                  wr.left + (LONG)panelR.right, wr.top + (LONG)panelR.bottom }; }
+                float panelRadius = std::min(H(panelR) * 0.5f, 22.0f * scale);
                 {
-                    float pr = std::min(H(panelR) * 0.5f, 22.0f * scale);
-                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(panelR, pr, pr);
+                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(panelR, panelRadius, panelRadius);
                     pdc.dc->FillRoundedRectangle(rr, pdc.panel);
                     pdc.dc->DrawRoundedRectangle(rr, pdc.border, 1.0f);
                 }
+                // Real Windows blur-behind, scoped to the panel's rounded shape (BackdropStyle != None).
+                renderer.UpdateBackdropBlur(renderer.WantsBlur(), panelR, panelRadius);
                 surface.Layout(pdc, inner);
                 // Content is clipped to the animating panel and (during a morph) faded in through an
                 // opacity LAYER, so the incoming content never shows at full alpha while clipped in
