@@ -1992,16 +1992,21 @@ class Renderer {
         }
         // Resize/reposition the window whenever the PRESENT size changes (each morph frame) or on
         // an external layout change (settings / display change).
-        if (pxW != presentW_ || pxH != presentH_ || g_layoutDirty.exchange(false)) {
-            PositionOverlayWindow(settings, pxW, pxH);
-            presentW_ = pxW; presentH_ = pxH;
+        // Size/position the WINDOW to the (stable) DIB size, not the animating size. Because the DIB
+        // is held at max(current,target) for the whole morph, the window never repositions per-frame
+        // — the panel + content animate WITHIN a fixed window. This is what kills the horizontal
+        // sub-pixel jitter of the clock text (the window's centered x-position was rounding
+        // independently of the content origin every frame). At rest DIB == content, so no margin.
+        if (bitmapWidth_ != presentW_ || bitmapHeight_ != presentH_ || g_layoutDirty.exchange(false)) {
+            PositionOverlayWindow(settings, bitmapWidth_, bitmapHeight_);
+            presentW_ = bitmapWidth_; presentH_ = bitmapHeight_;
         }
         RECT rc = {0, 0, bitmapWidth_, bitmapHeight_};
         if (FAILED(target_->BindDC(memDc_, &rc))) return false;
         EnsureBrushes();  // device-dependent: must be created after BindDC
         target_->BeginDraw();
         target_->Clear(D2D1::ColorF(0, 0.0f));
-        innerOut = D2D1::RectF(padX, padY, padX + contentW, padY + contentH);  // present region, top-left
+        innerOut = D2D1::RectF(padX, padY, (float)bitmapWidth_ - padX, (float)bitmapHeight_ - padY);
         return true;
     }
     bool EndFrame(const Settings& settings) {
@@ -3012,34 +3017,37 @@ DWORD WINAPI RenderThreadProc(void*) {
                 DrawContext pdc = renderer.MakeContext(scale, now);  // brushes valid post-BindDC
                 pdc.artBmp = renderer.ArtBitmap(mediaNow.art.gen, mediaNow.art.w, mediaNow.art.h, mediaNow.art.bgra);
                 BindGlyphFormats(surface, renderer.GlyphFormat());
-                // Draw the gliding rounded panel ONCE (pill when short, rounded-rect when tall).
-                // Content is laid out at the locked size and clipped to this animating rect, so it
-                // is revealed as the panel grows instead of re-flowing / popping in.
+                // The gliding panel: animating size, TOP-anchored and horizontally centered inside
+                // the fixed window (`inner`). Only this rounded rect (and the content reveal) move;
+                // the window and the content's layout origin stay put -> no clock jitter.
+                float aw = std::min((float)cw, W(inner)), ah = std::min((float)ch, H(inner));
+                float panelLeft = std::floor((inner.left + inner.right - aw) * 0.5f + 0.5f);
+                D2D1_RECT_F panelR = D2D1::RectF(panelLeft, inner.top, panelLeft + aw, inner.top + ah);
                 {
-                    float pr = std::min(H(inner) * 0.5f, 22.0f * scale);
-                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(inner, pr, pr);
+                    float pr = std::min(H(panelR) * 0.5f, 22.0f * scale);
+                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(panelR, pr, pr);
                     pdc.dc->FillRoundedRectangle(rr, pdc.panel);
                     pdc.dc->DrawRoundedRectangle(rr, pdc.border, 1.0f);
                 }
                 surface.Layout(pdc, inner);
-                // Content is clipped to the animating panel. During a morph (contentAlpha < 1) we
-                // fade it in through an opacity LAYER so the incoming big content never shows at
-                // full alpha while clipped in the small pill; at rest a plain clip is used (cheaper).
+                // Content is clipped to the animating panel and (during a morph) faded in through an
+                // opacity LAYER, so the incoming content never shows at full alpha while clipped in
+                // the small pill; at rest a plain clip is used (cheaper).
                 ID2D1Layer* clyr = contentAlpha < 0.995f ? renderer.EnsureContentLayer() : nullptr;
                 if (clyr) {
-                    pdc.dc->PushLayer(D2D1::LayerParameters(inner, nullptr,
+                    pdc.dc->PushLayer(D2D1::LayerParameters(panelR, nullptr,
                         D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::Matrix3x2F::Identity(),
                         contentAlpha), clyr);
                     surface.Paint(pdc);
                     pdc.dc->PopLayer();
                 } else {
-                    pdc.dc->PushAxisAlignedClip(inner, D2D1_ANTIALIAS_MODE_ALIASED);
+                    pdc.dc->PushAxisAlignedClip(panelR, D2D1_ANTIALIAS_MODE_ALIASED);
                     surface.Paint(pdc);
                     pdc.dc->PopAxisAlignedClip();
                 }
-                // Privacy dots overlay (camera = green, mic = orange), pulsing, top-right.
+                // Privacy dots overlay (camera = green, mic = orange), pulsing, top-right of the panel.
                 if (g_micActive.load() || g_camActive.load()) {
-                    float pr = 3.5f * scale, px = inner.right - 12.0f * scale, py = inner.top + 11.0f * scale;
+                    float pr = 3.5f * scale, px = panelR.right - 12.0f * scale, py = panelR.top + 11.0f * scale;
                     float pulse = 0.55f + 0.45f * sinf((float)now * 4.0f);
                     if (g_camActive.load()) {
                         ComPtr<ID2D1SolidColorBrush> b;
