@@ -1586,7 +1586,10 @@ struct CalendarView : Widget {
         uint64_t gen = g_calGen.load(); int vk = vy * 13 + vm;
         if (gen == evGen_ && vk == evView_) return evDays_;
         evGen_ = gen; evView_ = vk; evDays_.clear();
-        for (auto& ev : CalendarSnapshot()) if (ev.start.wYear == vy && ev.start.wMonth == vm) evDays_.insert(ev.start.wDay);
+        // All-day events are hidden from the agenda, so keep the dot consistent with that: a day
+        // dot means "there's something to see if you click it".
+        for (auto& ev : CalendarSnapshot())
+            if (!ev.allDay && ev.start.wYear == vy && ev.start.wMonth == vm) evDays_.insert(ev.start.wDay);
         return evDays_;
     }
     void Init() {
@@ -1664,15 +1667,15 @@ struct AgendaList : Widget {
         bool selToday = (y == nowSt.wYear && m == nowSt.wMonth && d == nowSt.wDay);
         unsigned long long nowU = StampOf(nowSt);
         for (auto& e : CalendarSnapshot()) {
+            if (e.allDay) continue;  // all-day events are hidden from the agenda
             if (!(e.start.wYear == y && e.start.wMonth == m && e.start.wDay == d)) continue;
-            if (selToday && !e.allDay) {
+            if (selToday) {
                 unsigned long long endU = StampOf(e.end.wYear ? e.end : e.start);
                 if (endU <= nowU) continue;  // already ended -> not upcoming
             }
             cache_.push_back(e);
         }
         std::sort(cache_.begin(), cache_.end(), [](const IcsEvent& a, const IcsEvent& b) {
-            if (a.allDay != b.allDay) return a.allDay;  // all-day first
             return StampOf(a.start) < StampOf(b.start);
         });
         return cache_;
@@ -2479,9 +2482,9 @@ std::wstring WeatherDetail() {
     }
     return s;
 }
-// The next N not-yet-ended events across today + upcoming days, sorted by start time.
-// Cached (render thread only) by calendar generation + minute so it isn't recomputed
-// from the full ~289-event store on every measure/paint frame while hovering.
+// The next N not-yet-ended events for TODAY ONLY (no spillover into future days), excluding
+// all-day events, sorted by start time. Cached (render thread only) by calendar generation +
+// minute so it isn't recomputed from the full ~289-event store on every hover frame.
 std::vector<IcsEvent> NextUpcomingEvents(int maxN) {
     static uint64_t cGen = (uint64_t)-1; static int cMin = -1; static int cN = -1;
     static std::vector<IcsEvent> cache;
@@ -2496,6 +2499,8 @@ std::vector<IcsEvent> NextUpcomingEvents(int maxN) {
     unsigned long long nowU = stamp(nowSt);
     std::vector<IcsEvent> out;
     for (auto& e : CalendarSnapshot()) {
+        if (e.allDay) continue;
+        if (!(e.start.wYear == nowSt.wYear && e.start.wMonth == nowSt.wMonth && e.start.wDay == nowSt.wDay)) continue;
         unsigned long long endU = stamp(e.end.wYear ? e.end : e.start);
         if (endU > nowU) out.push_back(e);
     }
