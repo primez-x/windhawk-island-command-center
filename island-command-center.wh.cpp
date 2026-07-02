@@ -1277,6 +1277,7 @@ struct DrawContext {
     IDWriteTextFormat* fBody = nullptr;
     IDWriteTextFormat* fSmall = nullptr;
     IDWriteTextFormat* fPill = nullptr;
+    IDWriteTextFormat* fPillSub = nullptr;  // small bold sub-text under the pill's clock (the date)
     IDWriteTextFormat* fGlyph = nullptr;
     ID2D1Bitmap* artBmp = nullptr;
 
@@ -1926,7 +1927,7 @@ class Renderer {
         return CreateBackingBitmap(360, 96);
     }
     void Shutdown() {
-        fHuge_.Reset(); fTitle_.Reset(); fBody_.Reset(); fSmall_.Reset(); fPill_.Reset(); fGlyph_.Reset();
+        fHuge_.Reset(); fTitle_.Reset(); fBody_.Reset(); fSmall_.Reset(); fPill_.Reset(); fPillSub_.Reset(); fGlyph_.Reset();
         bText_.Reset(); bMuted_.Reset(); bAccent_.Reset(); bPanel_.Reset(); bCard_.Reset();
         bBorder_.Reset(); bDivider_.Reset(); bTrack_.Reset();
         artBitmap_.Reset();
@@ -1953,7 +1954,7 @@ class Renderer {
         dc.panel = bPanel_.Get(); dc.card = bCard_.Get(); dc.border = bBorder_.Get();
         dc.divider = bDivider_.Get(); dc.track = bTrack_.Get();
         dc.fHuge = fHuge_.Get(); dc.fTitle = fTitle_.Get(); dc.fBody = fBody_.Get();
-        dc.fSmall = fSmall_.Get(); dc.fPill = fPill_.Get(); dc.fGlyph = fGlyph_.Get();
+        dc.fSmall = fSmall_.Get(); dc.fPill = fPill_.Get(); dc.fPillSub = fPillSub_.Get(); dc.fGlyph = fGlyph_.Get();
         return dc;
     }
     IDWriteTextFormat* GlyphFormat() const { return fGlyph_.Get(); }
@@ -2059,7 +2060,7 @@ class Renderer {
 
     void EnsureFormats(float scale) {
         if (fTitle_ && std::fabs(scale - lastScale_) < 0.001f) return;
-        fHuge_.Reset(); fTitle_.Reset(); fBody_.Reset(); fSmall_.Reset(); fPill_.Reset(); fGlyph_.Reset();
+        fHuge_.Reset(); fTitle_.Reset(); fBody_.Reset(); fSmall_.Reset(); fPill_.Reset(); fPillSub_.Reset(); fGlyph_.Reset();
         auto mk = [&](const wchar_t* family, DWRITE_FONT_WEIGHT w, float size, ComPtr<IDWriteTextFormat>& out) {
             dwriteFactory_->CreateTextFormat(family, nullptr, w, DWRITE_FONT_STYLE_NORMAL,
                                              DWRITE_FONT_STRETCH_NORMAL, size * scale, L"", &out);
@@ -2070,10 +2071,15 @@ class Renderer {
         mk(L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_NORMAL, 13.0f, fBody_);
         mk(L"Segoe UI Variable Small", DWRITE_FONT_WEIGHT_NORMAL, 11.5f, fSmall_);
         mk(L"Segoe UI Variable Display", DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0f, fPill_);
+        mk(L"Segoe UI Variable Small", DWRITE_FONT_WEIGHT_BOLD, 10.5f, fPillSub_);  // pill date: -1pt, bold
         mk(L"Segoe Fluent Icons", DWRITE_FONT_WEIGHT_NORMAL, 16.0f, fGlyph_);
         if (fPill_) {
             fPill_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             fPill_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+        if (fPillSub_) {
+            fPillSub_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            fPillSub_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         }
         if (fHuge_) { fHuge_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER); fHuge_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER); }
         for (auto* f : {fTitle_.Get(), fBody_.Get(), fSmall_.Get()})
@@ -2100,7 +2106,7 @@ class Renderer {
     ComPtr<IDWriteFactory> dwriteFactory_;
     ComPtr<ID2D1DCRenderTarget> target_;
     ComPtr<ID2D1Layer> contentLayer_;
-    ComPtr<IDWriteTextFormat> fHuge_, fTitle_, fBody_, fSmall_, fPill_, fGlyph_;
+    ComPtr<IDWriteTextFormat> fHuge_, fTitle_, fBody_, fSmall_, fPill_, fPillSub_, fGlyph_;
     ComPtr<ID2D1SolidColorBrush> bText_, bMuted_, bAccent_, bPanel_, bCard_, bBorder_, bDivider_, bTrack_;
     ComPtr<ID2D1Bitmap> artBitmap_;
     uint64_t artGen_ = 0;
@@ -2503,11 +2509,11 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
     if (s == SurfaceState::Collapsed) {
         auto pill = std::make_unique<Custom>();
         pill->fixedHeight = 50.0f * dc.scale;
-        // [ time / date ]  |  weather  — time is the hero with the date as small sub-text beneath.
+        // [ time / date ]  |  weather  — time is the hero with a small bold date sub-text beneath.
         pill->prefWidth = [](const DrawContext& d) {
             const float s = d.scale;
             float leftW = std::max(d.MeasureWidth(d.fPill, TimeString()),
-                                   d.MeasureWidth(d.fSmall, DatePillString()));
+                                   d.MeasureWidth(d.fPillSub, DatePillString()));
             float total = 16.0f * s + leftW;
             if (WeatherFresh())
                 total += 12.0f * s + 1.2f * s + 12.0f * s + d.MeasureWidth(d.fPill, WeatherShort());
@@ -2516,13 +2522,21 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
         pill->paint = [](DrawContext& d, D2D1_RECT_F b) {
             const float s = d.scale;
             float leftW = std::max(d.MeasureWidth(d.fPill, TimeString()),
-                                   d.MeasureWidth(d.fSmall, DatePillString()));
-            float lx = b.left + 16.0f * s;
-            d.Text(TimeString(), d.fPill, D2D1::RectF(lx, b.top + 9.0f * s, lx + leftW, b.top + 32.0f * s),
+                                   d.MeasureWidth(d.fPillSub, DatePillString()));
+            // Compute the full content width and center it explicitly within b — robust to any
+            // drift between prefWidth's estimate and b's actual (spring-driven) width, so the
+            // time/date + weather block is always truly centered, not just left-anchored with
+            // matching margins that happen to line up.
+            float contentW = leftW;
+            bool wx = WeatherFresh();
+            if (wx) contentW += 12.0f * s + 1.2f * s + 12.0f * s + d.MeasureWidth(d.fPill, WeatherShort());
+            float lx = b.left + (W(b) - contentW) * 0.5f;
+            // Time/date stack, vertically centered as a unit within the pill with a tight gap.
+            d.Text(TimeString(), d.fPill, D2D1::RectF(lx, b.top + 8.0f * s, lx + leftW, b.top + 29.0f * s),
                    d.text, 0.96f, DWRITE_TEXT_ALIGNMENT_CENTER);
-            d.Text(DatePillString(), d.fSmall, D2D1::RectF(lx, b.top + 31.0f * s, lx + leftW, b.top + 47.0f * s),
-                   d.muted, 0.8f, DWRITE_TEXT_ALIGNMENT_CENTER);
-            if (WeatherFresh()) {
+            d.Text(DatePillString(), d.fPillSub, D2D1::RectF(lx, b.top + 27.0f * s, lx + leftW, b.top + 41.0f * s),
+                   d.muted, 0.85f, DWRITE_TEXT_ALIGNMENT_CENTER);
+            if (wx) {
                 float x = lx + leftW + 12.0f * s;
                 d.dc->FillRectangle(D2D1::RectF(x, b.top + 13.0f * s, x + 1.2f * s, b.bottom - 13.0f * s), d.divider);
                 x += 1.2f * s + 12.0f * s;
