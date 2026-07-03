@@ -5,7 +5,7 @@
 // @version         1.0.0
 // @author          Matt Pincoski
 // @include         island-host.exe
-// @compilerOptions -lole32 -loleaut32 -lshcore -ld2d1 -ldwrite -ldwmapi -lgdi32 -luser32 -lshell32 -lruntimeobject -lwindowscodecs -lavrt -lsetupapi -lwinhttp -lpdh -ldxva2 -ladvapi32 -lwinmm
+// @compilerOptions -lole32 -loleaut32 -lshcore -ld2d1 -ldwrite -ldwmapi -lgdi32 -luser32 -lshell32 -lruntimeobject -lwindowscodecs -lavrt -lsetupapi -lwinhttp -lpdh -ldxva2 -ladvapi32 -lwinmm -lcoremessaging -luuid
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -17,7 +17,8 @@ A ground-up reimagining of the Dynamic Island as a genuinely *interactive*,
 unified surface for native Windows features — instant volume & brightness
 sliders, a real notification center (history, dismiss, clear-all), a functional
 calendar backed by your Outlook published feed, media with live waveform, and
-the island's signature transient pills.
+the island's signature transient pills — dressed in real acrylic-style
+blur-behind materials (Backdrop style: Translucent / Glass / Frosted / Acrylic).
 
 Windhawk **tool mod**: runs in a dedicated `windhawk.exe` process and draws a
 layered, click-through overlay. It does not modify Explorer.
@@ -68,8 +69,11 @@ network) and a clock mod / the Taskbar Styler (clock).
   - Frosted: Frosted
   - Acrylic: Acrylic
   $description: >-
-    Tints the panel fill per style. Independent of Pill opacity (no more
-    compounding fade).
+    Panel material. Every style except None REALLY blurs whatever is behind
+    the island (desktop, windows) with per-style blur strength and tint,
+    matching the taskbar styler's WindowGlass presets. Falls back to a denser
+    tint if composition blur is unavailable (e.g. transparency effects are
+    off). Independent of Pill opacity.
 - CalendarIcsUrl: ""
   $name: Calendar ICS URL
   $description: >-
@@ -109,6 +113,7 @@ network) and a clock mod / the Taskbar Styler (clock).
 #include <timeapi.h>
 #include <shellapi.h>
 #include <d2d1.h>
+#include <d2d1effects.h>
 #include <dwrite.h>
 #include <wincodec.h>
 #include <shcore.h>
@@ -120,6 +125,7 @@ network) and a clock mod / the Taskbar Styler (clock).
 #include <highlevelmonitorconfigurationapi.h>
 #include <winhttp.h>
 #include <wrl/client.h>
+#include <dispatcherqueue.h>
 
 #include <algorithm>
 #include <array>
@@ -143,8 +149,13 @@ network) and a clock mod / the Taskbar Styler (clock).
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Foundation.Numerics.h>
+#include <winrt/Windows.Graphics.Effects.h>
 #include <winrt/Windows.Media.Control.h>
 #include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.System.h>
+#include <winrt/Windows.UI.Composition.h>
+#include <winrt/Windows.UI.Composition.Desktop.h>
 #if __has_include(<winrt/Windows.UI.Notifications.Management.h>) && \
     __has_include(<winrt/Windows.UI.Notifications.h>)
 #define ICC_HAS_NOTIFICATION_LISTENER 1
@@ -168,6 +179,265 @@ struct IAudioMeterInformation : public IUnknown {
 };
 static const GUID ICC_IID_IAudioMeterInformation = {
     0xC02216F6, 0x8C67, 0x4B5B, {0x9D, 0x00, 0xD0, 0x08, 0xE7, 0x3E, 0x00, 0x64}};
+
+// ---------------------------------------------------------------------------
+// Real blur-behind support declarations. The composition effect-graph interop
+// (windows.graphics.effects.interop.h) and ICompositorDesktopInterop are absent
+// from the bundled MinGW headers, so they are declared by hand — the same
+// pattern the installed taskbar styler mod compiles with on this toolchain.
+// ---------------------------------------------------------------------------
+namespace wge = winrt::Windows::Graphics::Effects;
+namespace wuc = winrt::Windows::UI::Composition;
+namespace wucd = winrt::Windows::UI::Composition::Desktop;
+
+namespace ABI {
+namespace Windows {
+namespace Graphics {
+namespace Effects {
+
+typedef interface IGraphicsEffectSource IGraphicsEffectSource;
+typedef interface IGraphicsEffectD2D1Interop IGraphicsEffectD2D1Interop;
+
+typedef enum GRAPHICS_EFFECT_PROPERTY_MAPPING {
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_UNKNOWN,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_VECTORX,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_VECTORY,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_VECTORZ,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_VECTORW,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_RECT_TO_VECTOR4,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_RADIANS_TO_DEGREES,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_COLORMATRIX_ALPHA_MODE,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_COLOR_TO_VECTOR3,
+    GRAPHICS_EFFECT_PROPERTY_MAPPING_COLOR_TO_VECTOR4
+} GRAPHICS_EFFECT_PROPERTY_MAPPING;
+
+#undef INTERFACE
+#define INTERFACE IGraphicsEffectD2D1Interop
+DECLARE_INTERFACE_IID_(IGraphicsEffectD2D1Interop, IUnknown,
+                       "2FC57384-A068-44D7-A331-30982FCF7177")
+{
+    STDMETHOD(GetEffectId)(GUID* id) PURE;
+    STDMETHOD(GetNamedPropertyMapping)(LPCWSTR name, UINT* index,
+                                       GRAPHICS_EFFECT_PROPERTY_MAPPING* mapping) PURE;
+    STDMETHOD(GetPropertyCount)(UINT* count) PURE;
+    STDMETHOD(GetProperty)(UINT index,
+                           winrt::impl::abi_t<winrt::Windows::Foundation::IPropertyValue>** value) PURE;
+    STDMETHOD(GetSource)(UINT index, IGraphicsEffectSource** source) PURE;
+    STDMETHOD(GetSourceCount)(UINT* count) PURE;
+};
+#undef INTERFACE
+
+}  // namespace Effects
+}  // namespace Graphics
+}  // namespace Windows
+}  // namespace ABI
+
+namespace awge = ABI::Windows::Graphics::Effects;
+
+template <>
+inline constexpr winrt::guid winrt::impl::guid_v<awge::IGraphicsEffectD2D1Interop>{
+    0x2FC57384, 0xA068, 0x44D7, {0xA3, 0x31, 0x30, 0x98, 0x2F, 0xCF, 0x71, 0x77}};
+
+// MinGW has no __uuidof for the raw ABI counterpart of IPropertyValue; forward the projected guid.
+template <>
+inline constexpr winrt::guid winrt::impl::guid_v<winrt::impl::abi_t<winrt::Windows::Foundation::IPropertyValue>>{
+    winrt::impl::guid_v<winrt::Windows::Foundation::IPropertyValue>};
+
+namespace ABI {
+namespace Windows {
+namespace UI {
+namespace Composition {
+
+#undef INTERFACE
+#define INTERFACE ICompositorDesktopInterop
+DECLARE_INTERFACE_IID_(ICompositorDesktopInterop, IUnknown,
+                       "29E691FA-4567-4DCA-B319-D0F207EB6807")
+{
+    STDMETHOD(CreateDesktopWindowTarget)(HWND hwndTarget, BOOL isTopmost, void** result) PURE;
+    STDMETHOD(EnsureOnThread)(DWORD threadId) PURE;
+};
+#undef INTERFACE
+
+}  // namespace Composition
+}  // namespace UI
+}  // namespace Windows
+}  // namespace ABI
+
+template <>
+inline constexpr winrt::guid winrt::impl::guid_v<ABI::Windows::UI::Composition::ICompositorDesktopInterop>{
+    0x29E691FA, 0x4567, 0x4DCA, {0xB3, 0x19, 0xD0, 0xF2, 0x07, 0xEB, 0x68, 0x07}};
+
+// Minimal Win2D-style effect descriptions for the composition effect graph (Win2D itself is
+// UWP-only): a D2D GaussianBlur plus a ColorMatrix used for the Acrylic saturation boost, each
+// exposing its D2D properties through IGraphicsEffectD2D1Interop.
+namespace icc_fx {
+
+using PropAbi = winrt::impl::abi_t<winrt::Windows::Foundation::IPropertyValue>;
+
+struct GaussianBlurEffect
+    : winrt::implements<GaussianBlurEffect, wge::IGraphicsEffect, wge::IGraphicsEffectSource,
+                        awge::IGraphicsEffectD2D1Interop> {
+    wge::IGraphicsEffectSource Source{nullptr};
+    float BlurAmount = 3.0f;
+    uint32_t Optimization = 1;                    // D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED
+    uint32_t BorderMode = D2D1_BORDER_MODE_HARD;  // matches the system acrylic recipe
+
+    // IGraphicsEffect
+    winrt::hstring Name() { return name_; }
+    void Name(winrt::hstring name) { name_ = name; }
+
+    // IGraphicsEffectD2D1Interop
+    HRESULT STDMETHODCALLTYPE GetEffectId(GUID* id) noexcept override {
+        if (!id) return E_INVALIDARG;
+        *id = CLSID_D2D1GaussianBlur;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetNamedPropertyMapping(
+        LPCWSTR name, UINT* index, awge::GRAPHICS_EFFECT_PROPERTY_MAPPING* mapping) noexcept override {
+        if (!name || !index || !mapping) return E_INVALIDARG;
+        if (wcscmp(name, L"BlurAmount") == 0) *index = D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION;
+        else if (wcscmp(name, L"Optimization") == 0) *index = D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION;
+        else if (wcscmp(name, L"BorderMode") == 0) *index = D2D1_GAUSSIANBLUR_PROP_BORDER_MODE;
+        else return E_INVALIDARG;
+        *mapping = awge::GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPropertyCount(UINT* count) noexcept override {
+        if (!count) return E_INVALIDARG;
+        *count = 3;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetProperty(UINT index, PropAbi** value) noexcept override try {
+        if (!value) return E_INVALIDARG;
+        using winrt::Windows::Foundation::PropertyValue;
+        switch (index) {
+            case D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION:
+                *value = PropertyValue::CreateSingle(BlurAmount).as<PropAbi>().detach();
+                break;
+            case D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION:
+                *value = PropertyValue::CreateUInt32(Optimization).as<PropAbi>().detach();
+                break;
+            case D2D1_GAUSSIANBLUR_PROP_BORDER_MODE:
+                *value = PropertyValue::CreateUInt32(BorderMode).as<PropAbi>().detach();
+                break;
+            default:
+                return E_BOUNDS;
+        }
+        return S_OK;
+    } catch (...) {
+        return winrt::to_hresult();
+    }
+    HRESULT STDMETHODCALLTYPE GetSource(UINT index, awge::IGraphicsEffectSource** source) noexcept override {
+        if (!source) return E_INVALIDARG;
+        if (index != 0 || !Source) return E_BOUNDS;
+        winrt::copy_to_abi(Source, *reinterpret_cast<void**>(source));
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetSourceCount(UINT* count) noexcept override {
+        if (!count) return E_INVALIDARG;
+        *count = 1;
+        return S_OK;
+    }
+
+   private:
+    winrt::hstring name_ = L"GaussianBlurEffect";
+};
+
+struct ColorMatrixEffect
+    : winrt::implements<ColorMatrixEffect, wge::IGraphicsEffect, wge::IGraphicsEffectSource,
+                        awge::IGraphicsEffectD2D1Interop> {
+    wge::IGraphicsEffectSource Source{nullptr};
+    // D2D1_MATRIX_5X4_F: 5 rows x 4 columns (20 floats), identity by default.
+    float Matrix[20] = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+        0, 0, 0, 0,
+    };
+    uint32_t AlphaMode = D2D1_COLORMATRIX_ALPHA_MODE_PREMULTIPLIED;
+    bool ClampOutput = false;
+
+    // Standard saturation matrix: lerp between Rec.709 luminance and identity (s > 1 boosts).
+    void SetSaturation(float s) {
+        constexpr float lr = 0.2126f, lg = 0.7152f, lb = 0.0722f;
+        const float inv = 1.0f - s;
+        const float m[20] = {
+            inv * lr + s, inv * lr,     inv * lr,     0,
+            inv * lg,     inv * lg + s, inv * lg,     0,
+            inv * lb,     inv * lb,     inv * lb + s, 0,
+            0,            0,            0,            1,
+            0,            0,            0,            0,
+        };
+        memcpy(Matrix, m, sizeof(m));
+    }
+
+    // IGraphicsEffect
+    winrt::hstring Name() { return name_; }
+    void Name(winrt::hstring name) { name_ = name; }
+
+    // IGraphicsEffectD2D1Interop
+    HRESULT STDMETHODCALLTYPE GetEffectId(GUID* id) noexcept override {
+        if (!id) return E_INVALIDARG;
+        *id = CLSID_D2D1ColorMatrix;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetNamedPropertyMapping(
+        LPCWSTR name, UINT* index, awge::GRAPHICS_EFFECT_PROPERTY_MAPPING* mapping) noexcept override {
+        if (!name || !index || !mapping) return E_INVALIDARG;
+        if (wcscmp(name, L"ColorMatrix") == 0) *index = D2D1_COLORMATRIX_PROP_COLOR_MATRIX;
+        else if (wcscmp(name, L"AlphaMode") == 0) *index = D2D1_COLORMATRIX_PROP_ALPHA_MODE;
+        else if (wcscmp(name, L"ClampOutput") == 0) *index = D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT;
+        else return E_INVALIDARG;
+        *mapping = awge::GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPropertyCount(UINT* count) noexcept override {
+        if (!count) return E_INVALIDARG;
+        *count = 3;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetProperty(UINT index, PropAbi** value) noexcept override try {
+        if (!value) return E_INVALIDARG;
+        using winrt::Windows::Foundation::PropertyValue;
+        switch (index) {
+            case D2D1_COLORMATRIX_PROP_COLOR_MATRIX:
+                *value = PropertyValue::CreateSingleArray(
+                             winrt::array_view<const float>(Matrix, Matrix + 20))
+                             .as<PropAbi>()
+                             .detach();
+                break;
+            case D2D1_COLORMATRIX_PROP_ALPHA_MODE:
+                *value = PropertyValue::CreateUInt32(AlphaMode).as<PropAbi>().detach();
+                break;
+            case D2D1_COLORMATRIX_PROP_CLAMP_OUTPUT:
+                *value = PropertyValue::CreateBoolean(ClampOutput).as<PropAbi>().detach();
+                break;
+            default:
+                return E_BOUNDS;
+        }
+        return S_OK;
+    } catch (...) {
+        return winrt::to_hresult();
+    }
+    HRESULT STDMETHODCALLTYPE GetSource(UINT index, awge::IGraphicsEffectSource** source) noexcept override {
+        if (!source) return E_INVALIDARG;
+        if (index != 0 || !Source) return E_BOUNDS;
+        winrt::copy_to_abi(Source, *reinterpret_cast<void**>(source));
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetSourceCount(UINT* count) noexcept override {
+        if (!count) return E_INVALIDARG;
+        *count = 1;
+        return S_OK;
+    }
+
+   private:
+    winrt::hstring name_ = L"ColorMatrixEffect";
+};
+
+}  // namespace icc_fx
 
 namespace {
 
@@ -569,22 +839,34 @@ inline std::vector<IcsEvent> ParseIcsEvents(const std::string& icsUtf8, const SY
 // ---------------------------------------------------------------------------
 enum class Position { TopCenter, TopLeft, TopRight, BottomCenter };
 
-// Backdrop tint presets for the panel fill. TINT/OPACITY ONLY -- see the memory/session notes for
-// why real blur isn't wired up: DwmEnableBlurBehindWindow is a no-op on this window type, and the
-// ACCENT_STATE_ENABLE_ACRYLICBLURBEHIND accent policy (SetWindowCompositionAttribute) ignores our
-// per-pixel alpha entirely and paints its own opaque rect over the WHOLE window -- both tried and
-// reverted. Real blur needs a Windows.UI.Composition HostBackdropBrush pipeline (unimplemented).
+// Backdrop presets. Styles use the WindowGlass theme constants of windows-11-taskbar-styler
+// verbatim (Translucent = blur 15 + #10808080 · Glass = blur 5 + chrome #1F1F1F @ 0.7 · Frosted =
+// blur 20 @ 0.7 · Acrylic = blur 30 @ 0.8). REAL blur comes from a companion
+// Windows.UI.Composition window whose CompositionBackdropBrush samples the live desktop content
+// behind the island — the same brush the WindowGlass taskbar theme blurs with — run through our
+// GaussianBlur effect at the preset radius (see BackdropBlurHost below). The tint stays in this
+// D2D panel fill, drawn over the blur. (HostBackdropBrush was tried first and empirically only
+// delivers a wallpaper-layer snapshot on build 26200 — windows behind never appear — so the plain
+// backdrop brush is the correct source.) When blur is unavailable (composition init failed,
+// transparency effects off) the denser fallback tint keeps the panel legible — the old tint-only
+// behavior.
 enum class BackdropStyle { None, Translucent, Glass, Frosted, Acrylic };
-struct BackdropPreset { float r, g, b, a; };
+struct BackdropPreset {
+    float r, g, b, a;      // panel tint while real blur is live (light: the blur is the material)
+    float fr, fg, fb, fa;  // fallback tint when blur is unavailable (dense: tint IS the material)
+    float blur;            // gaussian blur radius, logical px (WindowGlass BlurAmount)
+    float saturation;      // 1.0 = none (Acrylic adds the canonical 1.25 boost)
+};
 BackdropPreset PresetFor(BackdropStyle s) {
-    switch (s) {
-        case BackdropStyle::Translucent: return {0.45f, 0.45f, 0.47f, 0.40f};  // light gray tint
-        case BackdropStyle::Glass:       return {0.25f, 0.26f, 0.29f, 0.55f};  // cool gray
-        case BackdropStyle::Frosted:     return {0.45f, 0.45f, 0.47f, 0.62f};  // lighter/whiter, denser
-        case BackdropStyle::Acrylic:     return {0.09f, 0.09f, 0.11f, 0.82f};  // near-opaque dark
-        default:                         return {0.043f, 0.043f, 0.051f, 0.94f};  // None: today's solid panel
+    switch (s) {                        //  live tint                       fallback tint                    blur   sat
+        case BackdropStyle::Translucent: return {0.502f, 0.502f, 0.502f, 0.063f, 0.45f, 0.45f, 0.47f, 0.40f,  15.0f, 1.0f};
+        case BackdropStyle::Glass:       return {0.122f, 0.122f, 0.122f, 0.70f,  0.25f, 0.26f, 0.29f, 0.55f,   5.0f, 1.0f};
+        case BackdropStyle::Frosted:     return {0.122f, 0.122f, 0.122f, 0.70f,  0.45f, 0.45f, 0.47f, 0.62f,  20.0f, 1.0f};
+        case BackdropStyle::Acrylic:     return {0.122f, 0.122f, 0.122f, 0.80f,  0.09f, 0.09f, 0.11f, 0.82f,  30.0f, 1.25f};
+        default:                         return {0.043f, 0.043f, 0.051f, 0.94f,  0.043f, 0.043f, 0.051f, 0.94f, 0.0f, 1.0f};
     }
 }
+bool g_backdropBlurLive = false;  // render-thread only: did BackdropBlurHost deliver real blur this frame?
 
 struct Settings {
     Position position = Position::TopCenter;
@@ -2045,7 +2327,12 @@ class Renderer {
         if (FAILED(target_->BindDC(memDc_, &rc))) return false;
         EnsureBrushes();  // device-dependent: must be created after BindDC
         BackdropPreset preset = PresetFor(settings.backdropStyle);
-        if (bPanel_) bPanel_->SetColor(D2D1::ColorF(preset.r, preset.g, preset.b, preset.a));
+        if (bPanel_) {
+            if (g_backdropBlurLive)
+                bPanel_->SetColor(D2D1::ColorF(preset.r, preset.g, preset.b, preset.a));
+            else
+                bPanel_->SetColor(D2D1::ColorF(preset.fr, preset.fg, preset.fb, preset.fa));
+        }
         target_->BeginDraw();
         target_->Clear(D2D1::ColorF(0, 0.0f));
         innerOut = D2D1::RectF(padX, padY, (float)bitmapWidth_ - padX, (float)bitmapHeight_ - padY);
@@ -2199,6 +2486,265 @@ void Renderer::PositionOverlayWindow(const Settings& s, int width, int height) {
     HWND z = s.alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST;
     SetWindowPos(hwnd_, z, x, y, width, height, SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
 }
+
+// ===========================================================================
+// BackdropBlurHost — REAL blur-behind for the panel.
+//
+// The overlay itself is a WS_EX_LAYERED window presented with
+// UpdateLayeredWindow; nothing can blur "through" it (DwmEnableBlurBehindWindow
+// is a no-op there, and the accent-policy acrylic paints over the per-pixel
+// alpha — both tried and reverted, see git history). Instead a companion
+// WS_EX_NOREDIRECTIONBITMAP window is kept glued directly BENEATH the overlay
+// in z-order, hosting a Windows.UI.Composition visual whose
+// CompositionBackdropBrush samples the live desktop content behind the
+// companion (verified: windows moving behind update live). Sampling happens at
+// the companion's z-position, so the overlay in front is excluded. (The
+// documented HostBackdropBrush + DWMWA_USE_HOSTBACKDROPBRUSH route was tried
+// first and empirically only delivers a wallpaper-layer snapshot on build
+// 26200 — app windows behind never appear; the plain backdrop brush needs no
+// DWM attribute at all.) The visual is clipped to the animating rounded panel
+// rect every rendered frame, so the blur hugs the pill/panel exactly through
+// the morph. The companion never takes input (WM_NCHITTEST -> HTTRANSPARENT)
+// and is never activated. All composition objects live on the render thread,
+// whose message pump doubles as the required DispatcherQueue pump. If anything
+// in the chain fails (or the user disables transparency effects), the host
+// stays hidden and the panel falls back to the dense tint-only presets.
+// ===========================================================================
+constexpr wchar_t kBlurWindowClass[] = L"Windhawk.IslandCommandCenter.Blur";
+
+LRESULT CALLBACK BlurHostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;  // input always falls through
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+class BackdropBlurHost {
+   public:
+    // Per rendered frame, BEFORE BeginFrame: bring init/brush in line with the style and report
+    // whether real blur is live (BeginFrame picks the panel tint variant from that). Never throws.
+    bool Prepare(BackdropStyle style, float scale, HWND overlay) {
+        if (style == BackdropStyle::None || failed_ || !TransparencyEnabled()) {
+            Hide();
+            return false;
+        }
+        if (!EnsureInit(overlay)) return false;
+        if (style != builtStyle_ || std::fabs(scale - builtScale_) > 0.001f)
+            RebuildBrush(style, scale);
+        return !failed_;
+    }
+
+    // After the frame's panel rect is known: clip the blur to the (animating) rounded panel rect,
+    // mirror the overlay window's rect, and keep the companion directly beneath it in z-order.
+    void SyncGeometry(HWND overlay, D2D1_RECT_F panelR, float radius) {
+        if (!host_ || failed_) return;
+        try {  // clip BEFORE the first show so no unclipped blur ever flashes
+            clip_.Left(panelR.left);
+            clip_.Top(panelR.top);
+            clip_.Right(panelR.right);
+            clip_.Bottom(panelR.bottom);
+            winrt::Windows::Foundation::Numerics::float2 r{radius, radius};
+            clip_.TopLeftRadius(r);
+            clip_.TopRightRadius(r);
+            clip_.BottomLeftRadius(r);
+            clip_.BottomRightRadius(r);
+        } catch (...) {}
+        RECT wr;
+        if (!GetWindowRect(overlay, &wr)) return;
+        const bool moved = memcmp(&wr, &lastRect_, sizeof(RECT)) != 0;
+        // Reassert the sandwich whenever the overlay moved, we were hidden, or another window
+        // slipped between the overlay and the blur host.
+        if (moved || !shown_ || GetWindow(overlay, GW_HWNDNEXT) != host_) {
+            SetWindowPos(host_, overlay, wr.left, wr.top, wr.right - wr.left, wr.bottom - wr.top,
+                         SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+            lastRect_ = wr;
+            shown_ = true;
+        }
+    }
+
+    void Shutdown() {
+        g_backdropBlurLive = false;
+        Teardown();
+    }
+
+   private:
+    void Hide() {
+        if (shown_ && host_) {
+            ShowWindow(host_, SW_HIDE);
+            shown_ = false;
+        }
+    }
+
+    // The "Transparency effects" personalization toggle gates DWM backdrop sampling; when it's
+    // off the host backdrop delivers a flat fallback. Poll cheaply and fall back to tint-only.
+    bool TransparencyEnabled() {
+        const double now = NowSeconds();
+        if (now - transCheckedAt_ > 2.0) {
+            transCheckedAt_ = now;
+            DWORD v = 1, sz = sizeof(v);
+            if (RegGetValueW(HKEY_CURRENT_USER,
+                             L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                             L"EnableTransparency", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS)
+                transparencyOn_ = v != 0;
+            else
+                transparencyOn_ = true;  // value absent -> effects on
+        }
+        return transparencyOn_;
+    }
+
+    bool EnsureInit(HWND overlay) {
+        if (compositor_) return true;
+        failed_ = true;  // cleared only on full success; a partial init never retries
+        static bool classRegistered = false;
+        if (!classRegistered) {
+            WNDCLASSEXW wc = {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = BlurHostWndProc;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.lpszClassName = kBlurWindowClass;
+            if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+                Wh_Log(L"Backdrop blur: RegisterClassEx failed (%u)", GetLastError());
+                return false;
+            }
+            classRegistered = true;
+        }
+        RECT wr = {0, 0, 360, 96};
+        GetWindowRect(overlay, &wr);
+        host_ = CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                WS_EX_TRANSPARENT,
+            kBlurWindowClass, L"Island Backdrop", WS_POPUP, wr.left, wr.top,
+            std::max(1L, wr.right - wr.left), std::max(1L, wr.bottom - wr.top), nullptr, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        if (!host_) {
+            Wh_Log(L"Backdrop blur: CreateWindowEx failed (%u)", GetLastError());
+            return false;
+        }
+        try {
+            DispatcherQueueOptions dqo{sizeof(DispatcherQueueOptions), DQTYPE_THREAD_CURRENT,
+                                       DQTAT_COM_NONE};
+            HRESULT hr = CreateDispatcherQueueController(
+                dqo, reinterpret_cast<PDISPATCHERQUEUECONTROLLER*>(winrt::put_abi(controller_)));
+            if (FAILED(hr)) {
+                Wh_Log(L"Backdrop blur: CreateDispatcherQueueController failed (0x%08X)",
+                       (unsigned)hr);
+                Teardown();
+                return false;
+            }
+            compositor_ = wuc::Compositor();
+            auto interop = compositor_.as<ABI::Windows::UI::Composition::ICompositorDesktopInterop>();
+            hr = interop->CreateDesktopWindowTarget(host_, TRUE, winrt::put_abi(target_));
+            if (FAILED(hr)) {
+                Wh_Log(L"Backdrop blur: CreateDesktopWindowTarget failed (0x%08X)", (unsigned)hr);
+                Teardown();
+                return false;
+            }
+            visual_ = compositor_.CreateSpriteVisual();
+            visual_.RelativeSizeAdjustment({1.0f, 1.0f});
+            clip_ = compositor_.CreateRectangleClip();
+            visual_.Clip(clip_);
+            target_.Root(visual_);
+        } catch (const winrt::hresult_error& e) {
+            Wh_Log(L"Backdrop blur: composition init failed (0x%08X)", (unsigned)e.code().value);
+            Teardown();
+            return false;
+        } catch (...) {
+            Wh_Log(L"Backdrop blur: composition init failed");
+            Teardown();
+            return false;
+        }
+        builtStyle_ = BackdropStyle::None;  // force the first RebuildBrush
+        failed_ = false;
+        Wh_Log(L"Backdrop blur: composition pipeline ready.");
+        return true;
+    }
+
+    void RebuildBrush(BackdropStyle style, float scale) {
+        BackdropPreset p = PresetFor(style);
+        try {
+            // Plain backdrop brush = live, SHARP desktop content behind the companion window
+            // (the WindowGlass taskbar theme blurs with the same source). HostBackdropBrush was
+            // tried and only delivers a wallpaper-layer snapshot on this build.
+            auto backdrop = compositor_.CreateBackdropBrush();
+            const float radius = p.blur * scale;  // scale with the island's UI density
+            const bool wantSat = std::fabs(p.saturation - 1.0f) > 0.01f;
+            if (radius < 0.5f && !wantSat) {
+                visual_.Brush(backdrop);
+            } else {
+                wge::IGraphicsEffectSource top = wuc::CompositionEffectSourceParameter(L"backdrop");
+                if (radius >= 0.5f) {
+                    auto blur = winrt::make_self<icc_fx::GaussianBlurEffect>();
+                    blur->Source = top;
+                    blur->BlurAmount = radius;
+                    top = *blur;
+                }
+                if (wantSat) {
+                    auto sat = winrt::make_self<icc_fx::ColorMatrixEffect>();
+                    sat->Source = top;
+                    sat->SetSaturation(p.saturation);
+                    top = *sat;
+                }
+                auto factory = compositor_.CreateEffectFactory(top.as<wge::IGraphicsEffect>());
+                auto brush = factory.CreateBrush();
+                brush.SetSourceParameter(L"backdrop", backdrop);
+                visual_.Brush(brush);
+            }
+            builtStyle_ = style;
+            builtScale_ = scale;
+        } catch (const winrt::hresult_error& e) {
+            Wh_Log(L"Backdrop blur: brush build failed (0x%08X)", (unsigned)e.code().value);
+            failed_ = true;
+            Hide();
+        } catch (...) {
+            Wh_Log(L"Backdrop blur: brush build failed");
+            failed_ = true;
+            Hide();
+        }
+    }
+
+    void Teardown() {
+        try { if (visual_) visual_.Brush(nullptr); } catch (...) {}
+        clip_ = nullptr;
+        visual_ = nullptr;
+        try { if (target_) target_.Root(nullptr); } catch (...) {}
+        target_ = nullptr;
+        compositor_ = nullptr;
+        if (controller_) {
+            // DispatcherQueue contract: shut the queue down and keep pumping until it completes.
+            try {
+                auto action = controller_.ShutdownQueueAsync();
+                const ULONGLONG deadline = GetTickCount64() + 2000;
+                while (action.Status() == winrt::Windows::Foundation::AsyncStatus::Started &&
+                       GetTickCount64() < deadline) {
+                    MSG msg;
+                    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    Sleep(5);
+                }
+            } catch (...) {}
+            controller_ = nullptr;
+        }
+        if (host_) {
+            DestroyWindow(host_);
+            host_ = nullptr;
+        }
+        shown_ = false;
+    }
+
+    HWND host_ = nullptr;
+    bool failed_ = false;
+    bool shown_ = false;
+    RECT lastRect_ = {};
+    BackdropStyle builtStyle_ = BackdropStyle::None;
+    float builtScale_ = 0.0f;
+    bool transparencyOn_ = true;
+    double transCheckedAt_ = -10.0;
+    winrt::Windows::System::DispatcherQueueController controller_{nullptr};
+    wuc::Compositor compositor_{nullptr};
+    wucd::DesktopWindowTarget target_{nullptr};
+    wuc::SpriteVisual visual_{nullptr};
+    wuc::RectangleClip clip_{nullptr};
+};
 
 // ---------------------------------------------------------------------------
 // Brightness control (DDC/CI on the island's monitor; runs off the render thread)
@@ -2979,6 +3525,8 @@ DWORD WINAPI RenderThreadProc(void*) {
         surface.BuildFor(SurfaceState::Collapsed, seed);
     }
 
+    BackdropBlurHost blurHost;  // real blur-behind companion; lazy-inits on the first blurred style
+
     SpringValue wSpring, hSpring;
     wSpring.Reset(180.0f);
     hSpring.Reset(40.0f);
@@ -3108,6 +3656,9 @@ DWORD WINAPI RenderThreadProc(void*) {
         lastClockKey = clockKey;
 
         if (needsRender) {
+            // Real blur-behind: bring the companion window's state in line with the style BEFORE
+            // the frame is drawn — BeginFrame picks the panel tint variant from the result.
+            g_backdropBlurLive = blurHost.Prepare(s.backdropStyle, scale, hwnd);
             D2D1_RECT_F inner;
             int tgtW = (int)std::ceil(wSpring.target), tgtH = (int)std::ceil(hSpring.target);
             bool settled = wSpring.AtRest() && hSpring.AtRest();
@@ -3126,6 +3677,8 @@ DWORD WINAPI RenderThreadProc(void*) {
                   g_pillRect = { wr.left + (LONG)panelR.left, wr.top + (LONG)panelR.top,
                                  wr.left + (LONG)panelR.right, wr.top + (LONG)panelR.bottom }; }
                 float panelRadius = std::min(H(panelR) * 0.5f, 22.0f * scale);
+                // Keep the real-blur companion clipped to this exact panel rect (it animates too).
+                if (g_backdropBlurLive) blurHost.SyncGeometry(hwnd, panelR, panelRadius);
                 {
                     D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(panelR, panelRadius, panelRadius);
                     pdc.dc->FillRoundedRectangle(rr, pdc.panel);
@@ -3200,6 +3753,7 @@ DWORD WINAPI RenderThreadProc(void*) {
     if (hiRes) timeEndPeriod(1);
     g_surface = nullptr;
     RemoveDismissHook();
+    blurHost.Shutdown();
     renderer.Shutdown();
     if (g_hwnd) { DestroyWindow(g_hwnd); g_hwnd = nullptr; }
     if (SUCCEEDED(hrCo)) CoUninitialize();
