@@ -60,20 +60,54 @@ network) and a clock mod / the Taskbar Styler (clock).
 - PillOpacity: "1.0"
   $name: Pill opacity
   $description: 0.35 - 1.0. Fades the WHOLE island; independent of Backdrop style.
-- BackdropStyle: None
+- BackdropStyle: "$Acrylic"
   $name: Backdrop style
-  $options:
-  - None: None (solid panel)
-  - Translucent: Translucent
-  - Glass: Glass
-  - Frosted: Frosted
-  - Acrylic: Acrylic
   $description: >-
-    Panel material. Every style except None REALLY blurs whatever is behind
-    the island (desktop, windows) with per-style blur strength and tint,
-    matching the taskbar styler's WindowGlass presets. Falls back to a denser
-    tint if composition blur is unavailable (e.g. transparency effects are
-    off). Independent of Pill opacity.
+    An inline style string: "[$Name] [Key=Value ...]" — same $Name + Key=Value
+    convention as the Windows 11 Taskbar Styler mod. Every style except None
+    REALLY blurs whatever is behind the island (desktop, windows), matching
+    the taskbar styler's WindowGlass blur radii. Falls back to a denser tint
+    if composition blur is unavailable (e.g. transparency effects are off).
+    Independent of Pill opacity.
+
+
+    $Name (optional; leading "$" optional too) picks the base blur/saturation
+    profile — one of: None (disables the backdrop entirely — plain solid
+    panel), Translucent (blur 15), Glass (blur 5), Frosted (blur 20), Acrylic
+    (blur 30 + extra saturation). Omit it to start from Acrylic's profile.
+
+
+    Key=Value overrides apply left-to-right (last one wins) on top of the
+    style's defaults:
+
+      BlurAmount=<px>       gaussian blur radius, logical px
+
+      TintSaturation=<f>    1.0 = none
+
+      TintColor=<c>         tint while blur is live. <c> is "accent" (the
+                             live Windows accent color — the default) or a
+                             hex color, "#RRGGBB" or "#AARRGGBB"
+
+      TintOpacity=<0-1>     overrides TintColor's alpha
+
+      FallbackColor=<c>     tint used when blur is unavailable (defaults to
+                             a darker accent-ramp shade); same syntax as
+                             TintColor
+
+      FallbackOpacity=<0-1> overrides FallbackColor's alpha
+
+
+    Examples:
+
+      $Acrylic                                   (default: accent-tinted acrylic)
+
+      $Glass TintColor=#3388CC TintOpacity=0.5    (custom blue glass)
+
+      $Frosted TintColor=accent FallbackColor=#1A1A1A
+
+      BlurAmount=22 TintSaturation=1.1            (fully custom, no named base)
+
+      None                                        (no backdrop at all)
 - CalendarIcsUrl: ""
   $name: Calendar ICS URL
   $description: >-
@@ -156,6 +190,7 @@ network) and a clock mod / the Taskbar Styler (clock).
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Composition.Desktop.h>
+#include <winrt/Windows.UI.ViewManagement.h>
 #if __has_include(<winrt/Windows.UI.Notifications.Management.h>) && \
     __has_include(<winrt/Windows.UI.Notifications.h>)
 #define ICC_HAS_NOTIFICATION_LISTENER 1
@@ -839,31 +874,147 @@ inline std::vector<IcsEvent> ParseIcsEvents(const std::string& icsUtf8, const SY
 // ---------------------------------------------------------------------------
 enum class Position { TopCenter, TopLeft, TopRight, BottomCenter };
 
-// Backdrop presets. Styles use the WindowGlass theme constants of windows-11-taskbar-styler
-// verbatim (Translucent = blur 15 + #10808080 · Glass = blur 5 + chrome #1F1F1F @ 0.7 · Frosted =
-// blur 20 @ 0.7 · Acrylic = blur 30 @ 0.8). REAL blur comes from a companion
-// Windows.UI.Composition window whose CompositionBackdropBrush samples the live desktop content
-// behind the island — the same brush the WindowGlass taskbar theme blurs with — run through our
-// GaussianBlur effect at the preset radius (see BackdropBlurHost below). The tint stays in this
-// D2D panel fill, drawn over the blur. (HostBackdropBrush was tried first and empirically only
-// delivers a wallpaper-layer snapshot on build 26200 — windows behind never appear — so the plain
-// backdrop brush is the correct source.) When blur is unavailable (composition init failed,
-// transparency effects off) the denser fallback tint keeps the panel legible — the old tint-only
-// behavior.
-enum class BackdropStyle { None, Translucent, Glass, Frosted, Acrylic };
+// Backdrop presets, selected by an INLINE STYLE STRING (the `BackdropStyle` setting), e.g.
+// "$Acrylic" or "$Glass TintColor=#3388CC TintOpacity=0.5" — same $Name + Key=Value convention as
+// windows-11-taskbar-styler. Styles use the WindowGlass theme's blur radii verbatim (Translucent =
+// 15px · Glass = 5px · Frosted = 20px · Acrylic = 30px, +1.25 saturation). REAL blur comes from a
+// companion Windows.UI.Composition window whose CompositionBackdropBrush samples the live desktop
+// content behind the island — the same brush the WindowGlass taskbar theme blurs with — run
+// through our GaussianBlur effect at the preset radius (see BackdropBlurHost below). The tint
+// stays in this D2D panel fill, drawn over the blur. (HostBackdropBrush was tried first and
+// empirically only delivers a wallpaper-layer snapshot on build 26200 — windows behind never
+// appear — so the plain backdrop brush is the correct source.) When blur is unavailable
+// (composition init failed, transparency effects off) the denser fallback tint keeps the panel
+// legible — the old tint-only behavior.
+//
+// Tint defaults to the live Windows accent color (TintColor/FallbackColor = "accent", the
+// default) rather than a fixed hue, so the island matches the user's theme; ResolveAccentColors()
+// fills r/g/b or fr/fg/fb from a cached UISettings lookup wherever the corresponding *UsesAccent
+// flag is set. An explicit TintColor=/FallbackColor= (hex) clears that flag for that channel.
 struct BackdropPreset {
     float r, g, b, a;      // panel tint while real blur is live (light: the blur is the material)
     float fr, fg, fb, fa;  // fallback tint when blur is unavailable (dense: tint IS the material)
     float blur;            // gaussian blur radius, logical px (WindowGlass BlurAmount)
     float saturation;      // 1.0 = none (Acrylic adds the canonical 1.25 boost)
+    bool liveUsesAccent = false;
+    bool fallbackUsesAccent = false;
 };
-BackdropPreset PresetFor(BackdropStyle s) {
-    switch (s) {                        //  live tint                       fallback tint                    blur   sat
-        case BackdropStyle::Translucent: return {0.502f, 0.502f, 0.502f, 0.063f, 0.45f, 0.45f, 0.47f, 0.40f,  15.0f, 1.0f};
-        case BackdropStyle::Glass:       return {0.122f, 0.122f, 0.122f, 0.70f,  0.25f, 0.26f, 0.29f, 0.55f,   5.0f, 1.0f};
-        case BackdropStyle::Frosted:     return {0.122f, 0.122f, 0.122f, 0.70f,  0.45f, 0.45f, 0.47f, 0.62f,  20.0f, 1.0f};
-        case BackdropStyle::Acrylic:     return {0.122f, 0.122f, 0.122f, 0.80f,  0.09f, 0.09f, 0.11f, 0.82f,  30.0f, 1.25f};
-        default:                         return {0.043f, 0.043f, 0.051f, 0.94f,  0.043f, 0.043f, 0.051f, 0.94f, 0.0f, 1.0f};
+// Named style bases: (blur, saturation, live alpha, fallback alpha). Color is accent-derived
+// unless overridden. NOTE on alphas: the WindowGlass TintOpacity values (0.7/0.7/0.8) were
+// designed for a taskbar strip over wallpaper and read as a SOLID slab on a floating panel — an
+// 0.8 tint over a 30px blur compresses a full white->black swing behind the panel into ~25
+// luminance points (measured). The alphas below are retuned so content visibly swims through
+// while keeping the WindowGlass blur radii and clearest->densest ordering.
+struct BackdropStyleBase { float blur, saturation, liveAlpha, fallbackAlpha; };
+bool LookupBackdropStyleBase(const std::wstring& name, BackdropStyleBase& out) {
+    struct Entry { const wchar_t* name; BackdropStyleBase base; };
+    static const Entry kStyles[] = {
+        //  name             blur   sat    liveA  fallbackA
+        {L"Translucent", {  15.0f, 1.00f, 0.063f, 0.40f}},
+        {L"Glass",       {   5.0f, 1.00f, 0.42f,  0.55f}},
+        {L"Frosted",     {  20.0f, 1.00f, 0.48f,  0.62f}},
+        {L"Acrylic",     {  30.0f, 1.25f, 0.58f,  0.82f}},
+    };
+    for (auto& e : kStyles) {
+        if (EqualsNoCase(name, e.name)) { out = e.base; return true; }
+    }
+    return false;
+}
+// Parses a hex color into r/g/b/a (0..1). Accepts "#RRGGBB" or "#AARRGGBB" (leading '#'
+// optional); 6 digits leave *outA untouched (caller keeps the preset's existing alpha) since only
+// an explicit 8-digit value or a separate *Opacity= token should set alpha. Returns false (leaves
+// outputs untouched) on a malformed value so a typo can't silently zero out a color.
+bool ParseHexColor(const std::wstring& text, float* outR, float* outG, float* outB, float* outA) {
+    const wchar_t* p = text.c_str();
+    if (*p == L'#') ++p;
+    size_t len = wcslen(p);
+    if (len != 6 && len != 8) return false;
+    for (size_t i = 0; i < len; ++i) if (!iswxdigit(p[i])) return false;
+    wchar_t* end = nullptr;
+    unsigned long v = wcstoul(p, &end, 16);
+    if (!end || *end != L'\0') return false;
+    if (len == 8) { *outA = ((v >> 24) & 0xFF) / 255.0f; v &= 0xFFFFFF; }
+    *outR = ((v >> 16) & 0xFF) / 255.0f;
+    *outG = ((v >> 8) & 0xFF) / 255.0f;
+    *outB = (v & 0xFF) / 255.0f;
+    return true;
+}
+// Parses the BackdropStyle setting string into a resolved-recipe preset + whether the backdrop
+// (tint + real blur) is enabled at all. Grammar: "[$Name] [Key=Value ...]" — an optional
+// $None/$Translucent/$Glass/$Frosted/$Acrylic token (leading '$' optional) picks the base blur/
+// saturation/alpha profile (default base if omitted: Acrylic's), followed by any number of
+// space-separated overrides, applied left-to-right (last write wins): BlurAmount, TintSaturation,
+// TintColor (accent|#RRGGBB|#AARRGGBB), TintOpacity, FallbackColor, FallbackOpacity. An empty
+// string or "None"/"$None" disables the backdrop entirely (today's plain solid panel).
+void ParseBackdropStyle(const std::wstring& raw, BackdropPreset& outPreset, bool& outEnabled) {
+    std::wstring trimmed = raw;
+    while (!trimmed.empty() && iswspace(trimmed.front())) trimmed.erase(trimmed.begin());
+    while (!trimmed.empty() && iswspace(trimmed.back())) trimmed.pop_back();
+    if (trimmed.empty() || EqualsNoCase(trimmed, L"None") || EqualsNoCase(trimmed, L"$None")) {
+        outEnabled = false;
+        // BeginFrame still reads fr/fg/fb/fa for the (always-fallback, blur never live) panel
+        // fill when disabled -- leaving this zero-initialized renders a fully transparent panel.
+        outPreset = {0.043f, 0.043f, 0.051f, 0.94f, 0.043f, 0.043f, 0.051f, 0.94f, 0.0f, 1.0f, false, false};
+        return;
+    }
+    outEnabled = true;
+
+    // Tokenize on whitespace.
+    std::vector<std::wstring> tokens;
+    { std::wstring cur;
+      for (wchar_t c : trimmed) {
+          if (iswspace(c)) { if (!cur.empty()) { tokens.push_back(cur); cur.clear(); } }
+          else cur.push_back(c);
+      }
+      if (!cur.empty()) tokens.push_back(cur); }
+
+    // Base: a recognized $Name (leading '$' optional), else default to Acrylic's profile so a
+    // bare "BlurAmount=20" line is still meaningful on its own.
+    BackdropStyleBase base;
+    size_t next = 0;
+    std::wstring first = tokens.empty() ? L"" : tokens[0];
+    if (!first.empty() && first[0] == L'$') first.erase(first.begin());
+    if (!tokens.empty() && LookupBackdropStyleBase(first, base)) {
+        next = 1;
+    } else {
+        LookupBackdropStyleBase(L"Acrylic", base);
+    }
+    outPreset.blur = base.blur;
+    outPreset.saturation = base.saturation;
+    outPreset.a = base.liveAlpha;
+    outPreset.fa = base.fallbackAlpha;
+    outPreset.liveUsesAccent = true;
+    outPreset.fallbackUsesAccent = true;
+
+    for (size_t i = next; i < tokens.size(); ++i) {
+        size_t eq = tokens[i].find(L'=');
+        if (eq == std::wstring::npos) {
+            Wh_Log(L"BackdropStyle: ignoring malformed token '%s' (expected Key=Value)", tokens[i].c_str());
+            continue;
+        }
+        std::wstring key = tokens[i].substr(0, eq);
+        std::wstring val = tokens[i].substr(eq + 1);
+        if (EqualsNoCase(key, L"BlurAmount")) {
+            outPreset.blur = std::max(0.0f, static_cast<float>(_wtof(val.c_str())));
+        } else if (EqualsNoCase(key, L"TintSaturation")) {
+            outPreset.saturation = static_cast<float>(_wtof(val.c_str()));
+        } else if (EqualsNoCase(key, L"TintOpacity")) {
+            outPreset.a = Clamp(static_cast<float>(_wtof(val.c_str())), 0.0f, 1.0f);
+        } else if (EqualsNoCase(key, L"FallbackOpacity")) {
+            outPreset.fa = Clamp(static_cast<float>(_wtof(val.c_str())), 0.0f, 1.0f);
+        } else if (EqualsNoCase(key, L"TintColor")) {
+            if (EqualsNoCase(val, L"accent")) outPreset.liveUsesAccent = true;
+            else if (ParseHexColor(val, &outPreset.r, &outPreset.g, &outPreset.b, &outPreset.a))
+                outPreset.liveUsesAccent = false;
+            else Wh_Log(L"BackdropStyle: bad TintColor '%s'", val.c_str());
+        } else if (EqualsNoCase(key, L"FallbackColor")) {
+            if (EqualsNoCase(val, L"accent")) outPreset.fallbackUsesAccent = true;
+            else if (ParseHexColor(val, &outPreset.fr, &outPreset.fg, &outPreset.fb, &outPreset.fa))
+                outPreset.fallbackUsesAccent = false;
+            else Wh_Log(L"BackdropStyle: bad FallbackColor '%s'", val.c_str());
+        } else {
+            Wh_Log(L"BackdropStyle: unknown attribute '%s'", key.c_str());
+        }
     }
 }
 bool g_backdropBlurLive = false;  // render-thread only: did BackdropBlurHost deliver real blur this frame?
@@ -877,7 +1028,8 @@ struct Settings {
     bool autoDpiScale = true;
     bool alwaysOnTop = true;
     float pillOpacity = 1.0f;
-    BackdropStyle backdropStyle = BackdropStyle::None;
+    bool backdropEnabled = false;
+    BackdropPreset backdrop{};  // parsed recipe; accent-flagged channels resolved per-frame
     std::wstring calendarIcsUrl;
     int calendarRefreshMinutes = 20;
     bool brightnessEnabled = true;
@@ -908,12 +1060,7 @@ void LoadSettings() {
     next.alwaysOnTop = Wh_GetIntSetting(L"AlwaysOnTop") != 0;
     const std::wstring opacity = GetStringSettingCopy(L"PillOpacity");
     next.pillOpacity = opacity.empty() ? 1.0f : Clamp(static_cast<float>(_wtof(opacity.c_str())), 0.35f, 1.0f);
-    const std::wstring backdrop = GetStringSettingCopy(L"BackdropStyle");
-    if (EqualsNoCase(backdrop, L"Translucent")) next.backdropStyle = BackdropStyle::Translucent;
-    else if (EqualsNoCase(backdrop, L"Glass")) next.backdropStyle = BackdropStyle::Glass;
-    else if (EqualsNoCase(backdrop, L"Frosted")) next.backdropStyle = BackdropStyle::Frosted;
-    else if (EqualsNoCase(backdrop, L"Acrylic")) next.backdropStyle = BackdropStyle::Acrylic;
-    else next.backdropStyle = BackdropStyle::None;
+    ParseBackdropStyle(GetStringSettingCopy(L"BackdropStyle"), next.backdrop, next.backdropEnabled);
     next.calendarIcsUrl = GetStringSettingCopy(L"CalendarIcsUrl");
     next.calendarRefreshMinutes = ClampInt(Wh_GetIntSetting(L"CalendarRefreshMinutes"), 5, 240);
     next.brightnessEnabled = Wh_GetIntSetting(L"BrightnessEnabled") != 0;
@@ -2298,7 +2445,7 @@ class Renderer {
     // smooth we size the backing DIB to the TARGET (allocated once per morph) and only present the
     // current size from its top-left — this eliminates the per-frame CreateDIBSection realloc +
     // shrink/grow GDI churn that made resizing choppy. Returns the inner content rect.
-    bool BeginFrame(const Settings& settings, int contentW, int contentH,
+    bool BeginFrame(const Settings& settings, const BackdropPreset& backdrop, int contentW, int contentH,
                     int targetW, int targetH, bool settled, float scale, D2D1_RECT_F& innerOut) {
         const float padX = kRenderPadX * scale, padY = kRenderPadY * scale;
         const int pxW = std::max(1, static_cast<int>(std::ceil(contentW + padX * 2.0f)));  // present
@@ -2326,12 +2473,11 @@ class Renderer {
         RECT rc = {0, 0, bitmapWidth_, bitmapHeight_};
         if (FAILED(target_->BindDC(memDc_, &rc))) return false;
         EnsureBrushes();  // device-dependent: must be created after BindDC
-        BackdropPreset preset = PresetFor(settings.backdropStyle);
         if (bPanel_) {
             if (g_backdropBlurLive)
-                bPanel_->SetColor(D2D1::ColorF(preset.r, preset.g, preset.b, preset.a));
+                bPanel_->SetColor(D2D1::ColorF(backdrop.r, backdrop.g, backdrop.b, backdrop.a));
             else
-                bPanel_->SetColor(D2D1::ColorF(preset.fr, preset.fg, preset.fb, preset.fa));
+                bPanel_->SetColor(D2D1::ColorF(backdrop.fr, backdrop.fg, backdrop.fb, backdrop.fa));
         }
         target_->BeginDraw();
         target_->Clear(D2D1::ColorF(0, 0.0f));
@@ -2348,8 +2494,8 @@ class Renderer {
         blend.BlendOp = AC_SRC_OVER;
         // PillOpacity and a BackdropStyle's own tint alpha must not compound (they were multiplying,
         // making backdrop styles look far more washed out than their tint alone suggests). PillOpacity
-        // only applies to the plain solid panel (None); an active backdrop style's tint is authoritative.
-        float finalAlpha = (settings.backdropStyle == BackdropStyle::None) ? Clamp(settings.pillOpacity, 0.35f, 1.0f) : 1.0f;
+        // only applies to the plain solid panel (backdrop disabled); an active style's tint is authoritative.
+        float finalAlpha = !settings.backdropEnabled ? Clamp(settings.pillOpacity, 0.35f, 1.0f) : 1.0f;
         blend.SourceConstantAlpha = static_cast<BYTE>(finalAlpha * 255.0f);
         blend.AlphaFormat = AC_SRC_ALPHA;
         return UpdateLayeredWindow(hwnd_, nullptr, &dst, &size, memDc_, &src, 0, &blend, ULW_ALPHA) != FALSE;
@@ -2517,18 +2663,57 @@ LRESULT CALLBACK BlurHostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// Render-thread only: the live Windows accent color (+ a pre-darkened ramp variant for the
+// no-blur fallback tint), cached and polled every 2s — theme changes are rare, querying
+// UISettings 60x/second for a value that almost never changes would be wasteful. Reuses the
+// render thread's existing COM apartment (CoInitializeEx in RenderThreadProc; no separate
+// winrt::init_apartment needed — the same apartment already backs the Compositor calls above).
+struct AccentColors { float r = 0.20f, g = 0.55f, b = 1.0f, dr = 0.11f, dg = 0.31f, db = 0.57f; };
+AccentColors GetAccentColorsCached() {
+    static AccentColors cached;
+    static double checkedAt = -10.0;
+    const double now = NowSeconds();
+    if (now - checkedAt > 2.0) {
+        checkedAt = now;
+        try {
+            using winrt::Windows::UI::ViewManagement::UISettings;
+            using winrt::Windows::UI::ViewManagement::UIColorType;
+            UISettings us;
+            auto toF = [](winrt::Windows::UI::Color c) {
+                return std::array<float, 3>{c.R / 255.0f, c.G / 255.0f, c.B / 255.0f};
+            };
+            auto acc = toF(us.GetColorValue(UIColorType::Accent));
+            auto dark = toF(us.GetColorValue(UIColorType::AccentDark2));
+            cached = {acc[0], acc[1], acc[2], dark[0], dark[1], dark[2]};
+        } catch (...) {}  // keep the last-known (or default) colors on failure
+    }
+    return cached;
+}
+// Fills any accent-flagged channel of a (per-frame local copy of a) preset with the live accent
+// color. Never mutates the shared Settings recipe -- callers pass their own per-frame copy.
+void ResolveAccentColors(BackdropPreset& preset) {
+    if (!preset.liveUsesAccent && !preset.fallbackUsesAccent) return;
+    AccentColors ac = GetAccentColorsCached();
+    if (preset.liveUsesAccent) { preset.r = ac.r; preset.g = ac.g; preset.b = ac.b; }
+    if (preset.fallbackUsesAccent) { preset.fr = ac.dr; preset.fg = ac.dg; preset.fb = ac.db; }
+}
+
 class BackdropBlurHost {
    public:
     // Per rendered frame, BEFORE BeginFrame: bring init/brush in line with the style and report
     // whether real blur is live (BeginFrame picks the panel tint variant from that). Never throws.
-    bool Prepare(BackdropStyle style, float scale, HWND overlay) {
-        if (style == BackdropStyle::None || failed_ || !TransparencyEnabled()) {
+    bool Prepare(bool enabled, const BackdropPreset& preset, float scale, HWND overlay) {
+        if (!enabled || failed_ || !TransparencyEnabled()) {
             Hide();
             return false;
         }
         if (!EnsureInit(overlay)) return false;
-        if (style != builtStyle_ || std::fabs(scale - builtScale_) > 0.001f)
-            RebuildBrush(style, scale);
+        // The composition brush only encodes blur + saturation; tint color is applied later in
+        // D2D (Renderer::BeginFrame), so only those two need to trigger a rebuild.
+        if (std::fabs(preset.blur - builtBlur_) > 0.01f ||
+            std::fabs(preset.saturation - builtSaturation_) > 0.001f ||
+            std::fabs(scale - builtScale_) > 0.001f)
+            RebuildBrush(preset, scale);
         return !failed_;
     }
 
@@ -2651,21 +2836,20 @@ class BackdropBlurHost {
             Teardown();
             return false;
         }
-        builtStyle_ = BackdropStyle::None;  // force the first RebuildBrush
+        builtBlur_ = -1.0f; builtSaturation_ = -1.0f;  // sentinels: force the first RebuildBrush
         failed_ = false;
         Wh_Log(L"Backdrop blur: composition pipeline ready.");
         return true;
     }
 
-    void RebuildBrush(BackdropStyle style, float scale) {
-        BackdropPreset p = PresetFor(style);
+    void RebuildBrush(const BackdropPreset& preset, float scale) {
         try {
             // Plain backdrop brush = live, SHARP desktop content behind the companion window
             // (the WindowGlass taskbar theme blurs with the same source). HostBackdropBrush was
             // tried and only delivers a wallpaper-layer snapshot on this build.
             auto backdrop = compositor_.CreateBackdropBrush();
-            const float radius = p.blur * scale;  // scale with the island's UI density
-            const bool wantSat = std::fabs(p.saturation - 1.0f) > 0.01f;
+            const float radius = preset.blur * scale;  // scale with the island's UI density
+            const bool wantSat = std::fabs(preset.saturation - 1.0f) > 0.01f;
             if (radius < 0.5f && !wantSat) {
                 visual_.Brush(backdrop);
             } else {
@@ -2679,7 +2863,7 @@ class BackdropBlurHost {
                 if (wantSat) {
                     auto sat = winrt::make_self<icc_fx::ColorMatrixEffect>();
                     sat->Source = top;
-                    sat->SetSaturation(p.saturation);
+                    sat->SetSaturation(preset.saturation);
                     top = *sat;
                 }
                 auto factory = compositor_.CreateEffectFactory(top.as<wge::IGraphicsEffect>());
@@ -2687,7 +2871,8 @@ class BackdropBlurHost {
                 brush.SetSourceParameter(L"backdrop", backdrop);
                 visual_.Brush(brush);
             }
-            builtStyle_ = style;
+            builtBlur_ = preset.blur;
+            builtSaturation_ = preset.saturation;
             builtScale_ = scale;
         } catch (const winrt::hresult_error& e) {
             Wh_Log(L"Backdrop blur: brush build failed (0x%08X)", (unsigned)e.code().value);
@@ -2735,7 +2920,8 @@ class BackdropBlurHost {
     bool failed_ = false;
     bool shown_ = false;
     RECT lastRect_ = {};
-    BackdropStyle builtStyle_ = BackdropStyle::None;
+    float builtBlur_ = -1.0f;
+    float builtSaturation_ = -1.0f;
     float builtScale_ = 0.0f;
     bool transparencyOn_ = true;
     double transCheckedAt_ = -10.0;
@@ -3656,13 +3842,17 @@ DWORD WINAPI RenderThreadProc(void*) {
         lastClockKey = clockKey;
 
         if (needsRender) {
-            // Real blur-behind: bring the companion window's state in line with the style BEFORE
-            // the frame is drawn — BeginFrame picks the panel tint variant from the result.
-            g_backdropBlurLive = blurHost.Prepare(s.backdropStyle, scale, hwnd);
+            // Real blur-behind: resolve any accent-color channels against the live Windows accent
+            // (a per-frame LOCAL copy — never mutate the shared Settings recipe), then bring the
+            // companion window's state in line BEFORE the frame is drawn — BeginFrame picks the
+            // panel tint variant from the result.
+            BackdropPreset resolvedBackdrop = s.backdrop;
+            if (s.backdropEnabled) ResolveAccentColors(resolvedBackdrop);
+            g_backdropBlurLive = blurHost.Prepare(s.backdropEnabled, resolvedBackdrop, scale, hwnd);
             D2D1_RECT_F inner;
             int tgtW = (int)std::ceil(wSpring.target), tgtH = (int)std::ceil(hSpring.target);
             bool settled = wSpring.AtRest() && hSpring.AtRest();
-            if (renderer.BeginFrame(s, cw, ch, tgtW, tgtH, settled, scale, inner)) {
+            if (renderer.BeginFrame(s, resolvedBackdrop, cw, ch, tgtW, tgtH, settled, scale, inner)) {
                 DrawContext pdc = renderer.MakeContext(scale, now);  // brushes valid post-BindDC
                 pdc.artBmp = renderer.ArtBitmap(mediaNow.art.gen, mediaNow.art.w, mediaNow.art.h, mediaNow.art.bgra);
                 BindGlyphFormats(surface, renderer.GlyphFormat());
