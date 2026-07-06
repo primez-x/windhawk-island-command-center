@@ -2,14 +2,15 @@
 
 A from-scratch, **interactive** Windhawk overlay for Windows 11 — an island-styled,
 unified **control + notification center** inspired by the Dynamic Island design
-language, but with genuinely functional widgets (not just a pretty display).
+language, but with genuinely functional widgets (not just a pretty display) and
+a **real, variable-strength blur-behind** material (not a tint-only fake).
 
 It draws a layered pill at the top of your monitor that morphs between three states:
 
 - **Collapsed pill** — large centered clock + live weather (☀ 67°), with transient
   pills for volume/brightness changes, clipboard, USB/Bluetooth devices, and
   caps/num lock, plus pulsing **mic/camera privacy dots** when in use.
-- **Hover peek** — big clock, date, weather.
+- **Hover peek** — big clock, date, weather detail, and a mini "Up next" agenda.
 - **Control center** (click) — a pinned panel with:
   - **Now playing** — album art, transport, draggable scrub bar, live audio waveform.
   - **Volume** and **Brightness** sliders (instant; brightness via DDC/CI on the
@@ -20,6 +21,33 @@ It draws a layered pill at the top of your monitor that morphs between three sta
   - **Notification center** — full list, per‑item dismiss, clear‑all, click to
     launch the source app.
 
+## Real blur-behind
+
+Every backdrop style except `None` genuinely blurs whatever is behind the
+island — desktop, other windows, video — through a companion
+`Windows.UI.Composition` window kept glued directly beneath the overlay in
+z-order (see [Architecture](#architecture)). `BackdropStyle` is an **inline
+style string**, using the same `$Name` + `Key=Value` convention as the
+[Windows 11 Taskbar Styler](https://windhawk.net) mod:
+
+```
+$Acrylic                                    # default: accent-tinted acrylic
+$Glass TintColor=#3388CC TintOpacity=0.5    # custom blue glass
+$Frosted TintColor=accent FallbackColor=#1A1A1A
+BlurAmount=22 TintSaturation=1.1            # fully custom, no named base
+None                                        # no backdrop at all (solid panel)
+```
+
+`$Name` (leading `$` optional) selects the blur radius + saturation profile —
+`Translucent` (15px), `Glass` (5px), `Frosted` (20px), or `Acrylic` (30px +
+extra saturation) — matching the Taskbar Styler's WindowGlass theme radii.
+Tint defaults to your **live Windows accent color** (`TintColor=accent`/
+`FallbackColor=accent`, polled every couple of seconds so it follows a theme
+change) rather than a fixed hue; give it a hex color instead to override just
+that channel. `FallbackColor`/`FallbackOpacity` control the denser solid tint
+used when composition blur isn't available (transparency effects off, or init
+failed) — the panel degrades gracefully rather than disappearing.
+
 ## Architecture
 
 Direct2D layered window (per‑pixel alpha via `UpdateLayeredWindow`), a retained
@@ -27,7 +55,22 @@ widget tree (Panel / ScrollContainer / Slider / Button / NotifRow / MediaCard /
 CalendarView / AgendaList) with absolute hit‑rects, click‑through‑as‑policy (the
 collapsed pill never steals focus; the panel goes interactive on hover/open),
 `SetCapture` slider dragging, a `WH_MOUSE_LL` click‑outside dismiss, and a
-spring‑based size morph. Worker threads: render, media (GSMTC), audio meter
+spring‑based size morph (target-locked, content-fade-in, frame-paced) so the
+collapse/expand glide is smooth with no clock-text jitter.
+
+Real blur-behind is a **second window** — `WS_EX_NOREDIRECTIONBITMAP`,
+input-transparent — kept exactly beneath the overlay in z-order and resized to
+match it every frame. It hosts a `Windows.UI.Composition` `SpriteVisual` whose
+`CompositionBackdropBrush` (the live desktop content behind it) is run through
+a hand-built `IGraphicsEffectD2D1Interop` Gaussian-blur graph at the style's
+radius, clipped to the animating rounded panel rect so the blur hugs the pill
+through the morph. (The documented `HostBackdropBrush` +
+`DWMWA_USE_HOSTBACKDROPBRUSH` route was tried first and empirically only
+delivers a wallpaper-layer snapshot on build 26200 — app windows behind never
+appear — so the plain backdrop brush is the correct source here.) The tint
+itself stays in the Direct2D panel fill, drawn on top of the blur.
+
+Worker threads: render (owns both windows above), media (GSMTC), audio meter
 (`IAudioMeterInformation`), notifications (`UserNotificationListener`), brightness
 (DDC/CI), calendar (ICS over WinHTTP + a native iCalendar parser), weather
 (wttr.in), and mic/cam privacy (registry probe).
@@ -41,44 +84,90 @@ pattern, this mod targets its **own** host: **`island-host.exe`** (see
 the host exactly as it injects Explorer‑targeted mods, giving dedicated‑process
 isolation (out of Explorer) while remaining installable without the Windhawk GUI.
 
+## Companion mod: Island Taskbar Hider
+
+`island-taskbar.wh.cpp` is a deliberately minimal, separate mod (`@include
+explorer.exe`) that hides the native taskbar elements the island duplicates —
+clock/date (via the `ShowClock` registry setting), the notification/Control
+Center bell, and the battery/volume/network tray icons — so the island can own
+those surfaces without visual duplication. It contains no Direct2D, worker
+threads, or networking; everything happens on the taskbar's own UI thread, which
+keeps it safe to inject directly into `explorer.exe`. Don't run it alongside the
+*Taskbar tray system icon tweaks* mod — both hook the same `SystemTray.IconView`
+constructor.
+
 ## Build
 
 Uses Windhawk's bundled Clang (mingw‑w64, C++23). With `%LOCALAPPDATA%\Windhawk`
 as `$WH`:
 
 ```sh
-# The mod DLL
+# The overlay mod DLL
 clang++ --config "$WH/Compiler/bin/x86_64-w64-windows-gnu.cfg" @flags.rsp \
   -I"$WH/Compiler/include" -include whmodid.h -include windhawk_api.h \
   island-command-center.wh.cpp "$WH/Engine/1.7.3/64/windhawk.lib" \
   -lole32 -loleaut32 -lshcore -ld2d1 -ldwrite -ldwmapi -lgdi32 -luser32 -lshell32 \
   -lruntimeobject -lwindowscodecs -lavrt -lsetupapi -lwinhttp -lpdh -ldxva2 -ladvapi32 \
+  -lwinmm -lcoremessaging -luuid \
   -shared -Wl,--export-all-symbols -o island-command-center_1.0.0_100000.dll
 
 # The host exe
 clang++ --config "$WH/Compiler/bin/x86_64-w64-windows-gnu.cfg" -std=c++23 \
   -target x86_64-w64-mingw32 -DUNICODE -D_UNICODE -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 \
   -municode -mwindows -static island-host.cpp -o island-host.exe
+
+# The taskbar-hider companion mod DLL (optional)
+clang++ --config "$WH/Compiler/bin/x86_64-w64-windows-gnu.cfg" @flags.rsp \
+  -I"$WH/Compiler/include" -include whmodid-taskbar.h -include windhawk_api.h \
+  island-taskbar.wh.cpp "$WH/Engine/1.7.3/64/windhawk.lib" \
+  -lole32 -loleaut32 -lruntimeobject -lversion \
+  -shared -Wl,--export-all-symbols -o island-taskbar_1.0.0_100000.dll
 ```
 
 `flags.rsp` = Windhawk's `compile_flags.txt` minus `-x c++` / `-DWH_EDITING`, plus `-DWH_MOD`.
 
 ## Install (headless)
 
+**Overlay mod:**
+
 1. Place `island-host.exe` somewhere persistent (e.g.
    `%LOCALAPPDATA%\IslandCommandCenter\`) and add a Startup‑folder shortcut to it.
 2. Drop the compiled DLL in `%LOCALAPPDATA%\Windhawk\AppData\Engine\Mods\64\`.
 3. Write `…\Engine\Mods\island-command-center.ini` (UTF‑16LE) with `[Mod]`
    (`LibraryFileName`, `Include=island-host.exe`, `Architecture=x86-64`,
-   `Version`, `SettingsChangeTime`) + `[Settings]`.
+   `Version`, `SettingsChangeTime`) + `[Settings]` (defaults required — a
+   missing key reads as 0/empty).
 4. Add the mod id to `…\AppData\userprofile.json` `mods`.
 5. `windhawk.exe -restart -tray-only`, then launch `island-host.exe`.
 
+To pick up a new build without dropping the taskbar (a `-restart` re-injects
+*every* installed mod, which can transiently crash Explorer): kill
+`island-host.exe`, overwrite the deployed DLL's bytes **in place** (keep the
+filename the engine already knows), then relaunch `island-host.exe` — no
+`-restart` needed.
+
+**Taskbar-hider companion (optional):** same `[Mod]`/`[Settings]` ini pattern
+with `Include=explorer.exe`, then `windhawk.exe -restart -tray-only` (this one
+*does* need a restart, since it's a new mod the engine has to learn about) and
+restart Explorer if it drops during that restart.
+
 ## Settings
 
-`CalendarIcsUrl` (your Outlook published `.ics` — kept out of source/repo),
-`WeatherCity`, `WeatherFahrenheit`, `TargetMonitor`, `SizeScale`, `OffsetX/Y`,
-`Position`, `PillOpacity`, `BrightnessEnabled`, `CalendarRefreshMinutes`.
+- `Position` — `top-center` / `top-left` / `top-right` / `bottom-center`
+- `TargetMonitor` — 0 = primary, 1-8 = that monitor, -1 = follow the mouse
+- `OffsetX` / `OffsetY` — pixel offset from the anchor position
+- `SizeScale` — overall scale of the island (e.g. 0.9, 1.0, 1.25)
+- `AutoDpiScale` — scale with the monitor's DPI in addition to `SizeScale`
+- `AlwaysOnTop`
+- `PillOpacity` — 0.35–1.0, fades the whole island; independent of `BackdropStyle`
+- `BackdropStyle` — inline style string; see [Real blur-behind](#real-blur-behind)
+- `CalendarIcsUrl` — your Outlook published `.ics` feed URL (kept out of source/repo)
+- `CalendarRefreshMinutes`
+- `BrightnessEnabled`
+- `WeatherCity` — blank to auto-detect by IP
+- `WeatherFahrenheit`
+- `CaptureVolumeKeys` — intercept hardware volume keys so the island shows its
+  own popup instead of the native Windows OSD
 
 ## License
 
