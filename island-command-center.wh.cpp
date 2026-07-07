@@ -2702,18 +2702,18 @@ class BackdropBlurHost {
    public:
     // Per rendered frame, BEFORE BeginFrame: bring init/brush in line with the style and report
     // whether real blur is live (BeginFrame picks the panel tint variant from that). Never throws.
-    bool Prepare(bool enabled, const BackdropPreset& preset, float scale, HWND overlay) {
+    bool Prepare(bool enabled, const BackdropPreset& preset, HWND overlay) {
         if (!enabled || failed_ || !TransparencyEnabled()) {
             Hide();
             return false;
         }
         if (!EnsureInit(overlay)) return false;
         // The composition brush only encodes blur + saturation; tint color is applied later in
-        // D2D (Renderer::BeginFrame), so only those two need to trigger a rebuild.
+        // D2D (Renderer::BeginFrame), so only those two need to trigger a rebuild. Blur is
+        // DPI-independent (see RebuildBrush), so scale is deliberately NOT part of this.
         if (std::fabs(preset.blur - builtBlur_) > 0.01f ||
-            std::fabs(preset.saturation - builtSaturation_) > 0.001f ||
-            std::fabs(scale - builtScale_) > 0.001f)
-            RebuildBrush(preset, scale);
+            std::fabs(preset.saturation - builtSaturation_) > 0.001f)
+            RebuildBrush(preset);
         return !failed_;
     }
 
@@ -2842,13 +2842,19 @@ class BackdropBlurHost {
         return true;
     }
 
-    void RebuildBrush(const BackdropPreset& preset, float scale) {
+    void RebuildBrush(const BackdropPreset& preset) {
         try {
             // Plain backdrop brush = live, SHARP desktop content behind the companion window
             // (the WindowGlass taskbar theme blurs with the same source). HostBackdropBrush was
             // tried and only delivers a wallpaper-layer snapshot on this build.
             auto backdrop = compositor_.CreateBackdropBrush();
-            const float radius = preset.blur * scale;  // scale with the island's UI density
+            // BlurAmount is a Gaussian standard deviation in LOGICAL pixels; the D2D composition
+            // effect graph computes it DPI-independently, so it must NOT be multiplied by the
+            // island's DPI/size scale. (It was — on a 175% monitor that ~2x over-blurred every
+            // preset into full saturation, so Glass/Frosted/Acrylic looked identical and
+            // BlurAmount felt inert above ~3. Use the WindowGlass value directly, as the taskbar
+            // styler does.) radius 0 disables the D2D blur outright (documented).
+            const float radius = preset.blur;
             const bool wantSat = std::fabs(preset.saturation - 1.0f) > 0.01f;
             if (radius < 0.5f && !wantSat) {
                 visual_.Brush(backdrop);
@@ -2873,7 +2879,6 @@ class BackdropBlurHost {
             }
             builtBlur_ = preset.blur;
             builtSaturation_ = preset.saturation;
-            builtScale_ = scale;
         } catch (const winrt::hresult_error& e) {
             Wh_Log(L"Backdrop blur: brush build failed (0x%08X)", (unsigned)e.code().value);
             failed_ = true;
@@ -2922,7 +2927,6 @@ class BackdropBlurHost {
     RECT lastRect_ = {};
     float builtBlur_ = -1.0f;
     float builtSaturation_ = -1.0f;
-    float builtScale_ = 0.0f;
     bool transparencyOn_ = true;
     double transCheckedAt_ = -10.0;
     winrt::Windows::System::DispatcherQueueController controller_{nullptr};
@@ -3848,7 +3852,7 @@ DWORD WINAPI RenderThreadProc(void*) {
             // panel tint variant from the result.
             BackdropPreset resolvedBackdrop = s.backdrop;
             if (s.backdropEnabled) ResolveAccentColors(resolvedBackdrop);
-            g_backdropBlurLive = blurHost.Prepare(s.backdropEnabled, resolvedBackdrop, scale, hwnd);
+            g_backdropBlurLive = blurHost.Prepare(s.backdropEnabled, resolvedBackdrop, hwnd);
             D2D1_RECT_F inner;
             int tgtW = (int)std::ceil(wSpring.target), tgtH = (int)std::ceil(hSpring.target);
             bool settled = wSpring.AtRest() && hSpring.AtRest();
