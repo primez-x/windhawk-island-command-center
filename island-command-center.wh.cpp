@@ -2650,8 +2650,13 @@ void Renderer::PositionOverlayWindow(const Settings& s, int width, int height) {
 // 26200 — app windows behind never appear; the plain backdrop brush needs no
 // DWM attribute at all.) The visual is clipped to the animating rounded panel
 // rect every rendered frame, so the blur hugs the pill/panel exactly through
-// the morph. The companion never takes input (WM_NCHITTEST -> HTTRANSPARENT)
-// and is never activated. All composition objects live on the render thread,
+// the morph. The companion never takes input: it is WS_EX_LAYERED |
+// WS_EX_TRANSPARENT, the only combination that passes clicks through to
+// OTHER PROCESSES' windows below. (HTTRANSPARENT alone only defers within
+// the owning thread — and since this window spans the full expanded-panel
+// footprint even while the pill is collapsed, anything less silently eats
+// every click over the phantom panel area.) It is never activated.
+// All composition objects live on the render thread,
 // whose message pump doubles as the required DispatcherQueue pump. If anything
 // in the chain fails (or the user disables transparency effects), the host
 // stays hidden and the panel falls back to the dense tint-only presets.
@@ -2793,9 +2798,14 @@ class BackdropBlurHost {
         }
         RECT wr = {0, 0, 360, 96};
         GetWindowRect(overlay, &wr);
+        // WS_EX_LAYERED + WS_EX_TRANSPARENT is required for real click-through: this window
+        // covers the full expanded-panel footprint even when collapsed, and WS_EX_TRANSPARENT
+        // (or HTTRANSPARENT) without LAYERED only yields to same-thread windows — clicks aimed
+        // at other apps behind the phantom panel area get eaten. With no redirection bitmap the
+        // layered machinery has no GDI surface to gate, so the composition visual still shows.
         host_ = CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-                WS_EX_TRANSPARENT,
+                WS_EX_LAYERED | WS_EX_TRANSPARENT,
             kBlurWindowClass, L"Island Backdrop", WS_POPUP, wr.left, wr.top,
             std::max(1L, wr.right - wr.left), std::max(1L, wr.bottom - wr.top), nullptr, nullptr,
             GetModuleHandleW(nullptr), nullptr);
@@ -2803,6 +2813,9 @@ class BackdropBlurHost {
             Wh_Log(L"Backdrop blur: CreateWindowEx failed (%u)", GetLastError());
             return false;
         }
+        // A layered window is only considered "committed" once its attributes are set; harmless
+        // no-op for the (absent) redirection surface, but guarantees DWM presents the visual.
+        SetLayeredWindowAttributes(host_, 0, 255, LWA_ALPHA);
         try {
             DispatcherQueueOptions dqo{sizeof(DispatcherQueueOptions), DQTYPE_THREAD_CURRENT,
                                        DQTAT_COM_NONE};
