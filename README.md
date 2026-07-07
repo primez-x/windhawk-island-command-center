@@ -7,12 +7,23 @@ a **real, variable-strength blur-behind** material (not a tint-only fake).
 
 It draws a layered pill at the top of your monitor that morphs between three states:
 
-- **Collapsed pill** — large centered clock + live weather (☀ 67°), with transient
-  pills for volume/brightness changes, clipboard, USB/Bluetooth devices, and
-  caps/num lock, plus pulsing **mic/camera privacy dots** when in use.
-- **Hover peek** — big clock, date, weather detail, and a mini "Up next" agenda.
+- **Collapsed pill** — large centered clock + live weather (☀ 67°), a mini
+  **volume element** (speaker glyph + vertical fill track: drag to set, click
+  to mute, scroll-wheel to step ±2%) in place of the old plain divider, and —
+  whenever something's playing — circular album art on the left edge and a
+  live waveform on the right, plus transient pills for brightness changes,
+  clipboard, USB/Bluetooth devices, and caps/num lock, and pulsing **mic/camera
+  privacy dots** when in use. **Middle-click anywhere on the island to hide it**
+  when it's in the way — it fades out smoothly (panel, blur, and content all
+  together) and fades back in the instant your cursor leaves the area it would
+  normally occupy, or after 15 seconds, whichever comes first.
+- **Hover peek** — big clock, date, weather detail, a live volume readout, a
+  compact now-playing row (circular art + title/artist) when media is active,
+  and a mini "Up next" agenda. Scroll-wheel here adjusts volume too.
 - **Control center** (click) — a pinned panel with:
-  - **Now playing** — album art, transport, draggable scrub bar, live audio waveform.
+  - **Now playing** — circular album art, friendly source name (Spotify/Edge/
+    etc.), transport, draggable scrub bar with elapsed/remaining time, live
+    audio waveform.
   - **Volume** and **Brightness** sliders (instant; brightness via DDC/CI on the
     island's monitor, auto-hidden if the monitor doesn't support it).
   - **Functional calendar** — month navigation, today, day selection, and a
@@ -20,6 +31,13 @@ It draws a layered pill at the top of your monitor that morphs between three sta
     timezones + recurrence handled).
   - **Notification center** — full list, per‑item dismiss, clear‑all, click to
     launch the source app.
+
+Media (album art, transport, the "now playing" glyph in every state) is
+sourced from Windows' System Media Transport Controls, so it works with any
+GSMTC-integrated app — Spotify, Edge/Chrome media, the native Media Player,
+etc. — with no per-app code; when more than one app has a session (e.g. a
+paused browser tab alongside Spotify), the island always shows/controls
+whichever one is actually **playing**.
 
 ## Real blur-behind
 
@@ -41,22 +59,48 @@ None                                        # no backdrop at all (solid panel)
 `$Name` (leading `$` optional) selects the blur radius + saturation profile —
 `Translucent` (15px), `Glass` (5px), `Frosted` (20px), or `Acrylic` (30px +
 extra saturation) — matching the Taskbar Styler's WindowGlass theme radii.
-Tint defaults to your **live Windows accent color** (`TintColor=accent`/
-`FallbackColor=accent`, polled every couple of seconds so it follows a theme
-change) rather than a fixed hue; give it a hex color instead to override just
-that channel. `FallbackColor`/`FallbackOpacity` control the denser solid tint
-used when composition blur isn't available (transparency effects off, or init
-failed) — the panel degrades gracefully rather than disappearing.
+Tint defaults to `TintColor=theme`/`FallbackColor=theme` — a neutral shade
+that follows the `Theme` setting below (see [Theming](#theming)) — rather
+than a fixed hue; `accent` (the live Windows accent color) and hex colors
+remain available as explicit overrides. `FallbackColor`/`FallbackOpacity`
+control the denser solid tint used when composition blur isn't available
+(transparency effects off, or init failed) — the panel degrades gracefully
+rather than disappearing. `FocusOpacity` sets how much denser the tint gets
+while hovered/open (default: `TintOpacity` + 0.25, capped at 0.92) — see
+[Theming](#theming). The default (`$Frosted`) matches the
+[Windows 11 Taskbar Styler](https://windhawk.net) mod's own WindowGlass blur
+amount, so the two read as one cohesive material rather than two different
+surfaces stacked on the same desktop.
 
-## Adaptive text
+## Theming
 
-The foreground adapts to whatever is behind the island: a sampler thread
-watches the composed desktop in thin strips just *outside* the panel (never
-the panel itself, which would feed back its own text), composites that with
-the active tint, and slides the whole text/divider/track palette between
-white-on-dark and black-on-light as the surface turns predominantly dark or
-light. Hysteresis, a minimum dwell, and a ~250ms fade keep video playing
-behind the island from ever strobing the text.
+`Theme` picks how the foreground palette (text/divider/border/track) and the
+`theme` tint keyword resolve, independent of what's actually behind the
+island:
+
+- **`auto`** (default) — follows Windows' own light/dark "choose your mode"
+  setting.
+- **`dark`** / **`light`** — force a side regardless of Windows or the
+  background.
+- **`adaptive`** — the original behavior: samples the desktop behind the
+  panel (thin strips just *outside* it, never the panel itself, which would
+  feed back its own text) and flips to match. A candidate flip must hold for
+  **~3 continuous seconds** before it's accepted, so briefly sliding a window
+  across the pill can no longer flicker the text — and every mode (not just
+  adaptive) now fades over a deliberately slow **~1.2s**, not the old ~250ms
+  snap.
+
+Detection (`auto`) and the `theme` tint keyword both go through
+`Windows.UI.ViewManagement.UISettings` — the *exact same* mechanism the
+Taskbar Styler mod uses internally for its own `{ThemeResource ...}` colors —
+rather than a registry poll, and the `theme` tint's live-side color is the
+actual system chrome/background color (not a made-up neutral), so the two
+mods land on matching colors rather than each guessing independently.
+
+Independently, the pill is **more transparent at rest and denser while
+hovered/open** (`TintOpacity` vs `FocusOpacity` in `BackdropStyle`, eased over
+~150ms) — so it stays unobtrusive sitting on the desktop but easy to read
+once you're actually looking at it.
 
 ## Architecture
 
@@ -170,7 +214,8 @@ restart Explorer if it drops during that restart.
 - `AutoDpiScale` — scale with the monitor's DPI in addition to `SizeScale`
 - `AlwaysOnTop`
 - `PillOpacity` — 0.35–1.0, fades the whole island; independent of `BackdropStyle`
-- `BackdropStyle` — inline style string; see [Real blur-behind](#real-blur-behind)
+- `Theme` — `auto` (default) / `dark` / `light` / `adaptive`; see [Theming](#theming)
+- `BackdropStyle` — inline style string; see [Real blur-behind](#real-blur-behind) and [Theming](#theming)
 - `CalendarIcsUrl` — your Outlook published `.ics` feed URL (kept out of source/repo)
 - `CalendarRefreshMinutes`
 - `BrightnessEnabled`

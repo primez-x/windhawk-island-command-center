@@ -60,6 +60,22 @@ network) and a clock mod / the Taskbar Styler (clock).
 - PillOpacity: "1.0"
   $name: Pill opacity
   $description: 0.35 - 1.0. Fades the WHOLE island; independent of Backdrop style.
+- Theme: auto
+  $name: Theme
+  $options:
+  - auto: Auto (follow Windows)
+  - dark: Dark
+  - light: Light
+  - adaptive: Adaptive (follow background)
+  $description: >-
+    Drives the text/divider/border palette and the default ("theme") tint
+    color in Backdrop style below. Auto follows the Windows "choose your
+    mode" (apps light/dark) setting. Dark/Light force a side regardless of
+    Windows or the background. Adaptive reverts to the old behavior: sampling
+    the desktop behind the island and flipping to match — it now requires the
+    background to hold steady for a few seconds before flipping, and fades
+    slowly, so briefly sliding a window across the pill no longer flickers
+    the text.
 - BackdropStyle: "$Acrylic"
   $name: Backdrop style
   $description: >-
@@ -84,22 +100,28 @@ network) and a clock mod / the Taskbar Styler (clock).
 
       TintSaturation=<f>    1.0 = none
 
-      TintColor=<c>         tint while blur is live. <c> is "accent" (the
-                             live Windows accent color — the default) or a
-                             hex color, "#RRGGBB" or "#AARRGGBB"
+      TintColor=<c>         tint while blur is live. <c> is "theme" (a
+                             neutral shade that follows the Theme setting
+                             above — the default), "accent" (the live
+                             Windows accent color), or a hex color,
+                             "#RRGGBB" or "#AARRGGBB"
 
-      TintOpacity=<0-1>     overrides TintColor's alpha
+      TintOpacity=<0-1>     overrides TintColor's alpha (this is the pill's
+                             REST-state opacity; see FocusOpacity)
 
       FallbackColor=<c>     tint used when blur is unavailable (defaults to
-                             a darker accent-ramp shade); same syntax as
-                             TintColor
+                             "theme"); same syntax as TintColor
 
       FallbackOpacity=<0-1> overrides FallbackColor's alpha
+
+      FocusOpacity=<0-1>    tint opacity while hovered/open, so content is
+                             easier to read while interacting (default:
+                             TintOpacity + 0.25, capped at 0.92)
 
 
     Examples:
 
-      $Acrylic                                   (default: accent-tinted acrylic)
+      $Acrylic                                   (default: theme-tinted acrylic)
 
       $Glass TintColor=#3388CC TintOpacity=0.5    (custom blue glass)
 
@@ -873,6 +895,7 @@ inline std::vector<IcsEvent> ParseIcsEvents(const std::string& icsUtf8, const SY
 // Settings
 // ---------------------------------------------------------------------------
 enum class Position { TopCenter, TopLeft, TopRight, BottomCenter };
+enum class ThemeMode { Auto, Dark, Light, Adaptive };
 
 // Backdrop presets, selected by an INLINE STYLE STRING (the `BackdropStyle` setting), e.g.
 // "$Acrylic" or "$Glass TintColor=#3388CC TintOpacity=0.5" — same $Name + Key=Value convention as
@@ -896,8 +919,11 @@ struct BackdropPreset {
     float fr, fg, fb, fa;  // fallback tint when blur is unavailable (dense: tint IS the material)
     float blur;            // gaussian blur radius, logical px (WindowGlass BlurAmount)
     float saturation;      // 1.0 = none (Acrylic adds the canonical 1.25 boost)
+    float focusA = -1.0f;  // hover/open tint opacity override; -1 = auto (see ApplyStateOpacity)
     bool liveUsesAccent = false;
     bool fallbackUsesAccent = false;
+    bool liveUsesTheme = false;
+    bool fallbackUsesTheme = false;
 };
 // Named style bases: (blur, saturation, live alpha, fallback alpha). Color is accent-derived
 // unless overridden. NOTE on alphas: the WindowGlass TintOpacity values (0.7/0.7/0.8) were
@@ -954,7 +980,10 @@ void ParseBackdropStyle(const std::wstring& raw, BackdropPreset& outPreset, bool
         outEnabled = false;
         // BeginFrame still reads fr/fg/fb/fa for the (always-fallback, blur never live) panel
         // fill when disabled -- leaving this zero-initialized renders a fully transparent panel.
-        outPreset = {0.043f, 0.043f, 0.051f, 0.94f, 0.043f, 0.043f, 0.051f, 0.94f, 0.0f, 1.0f, false, false};
+        // liveUsesTheme/fallbackUsesTheme=true so even the plain solid panel follows the Theme
+        // setting (ResolveBackdropColors overwrites r/g/b + fr/fg/fb below; alpha is untouched).
+        outPreset = {0.043f, 0.043f, 0.051f, 0.94f, 0.043f, 0.043f, 0.051f, 0.94f,
+                     0.0f, 1.0f, -1.0f, false, false, true, true};
         return;
     }
     outEnabled = true;
@@ -983,8 +1012,11 @@ void ParseBackdropStyle(const std::wstring& raw, BackdropPreset& outPreset, bool
     outPreset.saturation = base.saturation;
     outPreset.a = base.liveAlpha;
     outPreset.fa = base.fallbackAlpha;
-    outPreset.liveUsesAccent = true;
-    outPreset.fallbackUsesAccent = true;
+    outPreset.focusA = -1.0f;
+    // Default tint follows the Theme setting (a neutral shade), not the accent color — "accent"
+    // and hex colors remain available as explicit overrides below.
+    outPreset.liveUsesTheme = true;
+    outPreset.fallbackUsesTheme = true;
 
     for (size_t i = next; i < tokens.size(); ++i) {
         size_t eq = tokens[i].find(L'=');
@@ -1002,20 +1034,35 @@ void ParseBackdropStyle(const std::wstring& raw, BackdropPreset& outPreset, bool
             outPreset.a = Clamp(static_cast<float>(_wtof(val.c_str())), 0.0f, 1.0f);
         } else if (EqualsNoCase(key, L"FallbackOpacity")) {
             outPreset.fa = Clamp(static_cast<float>(_wtof(val.c_str())), 0.0f, 1.0f);
+        } else if (EqualsNoCase(key, L"FocusOpacity")) {
+            outPreset.focusA = Clamp(static_cast<float>(_wtof(val.c_str())), 0.0f, 1.0f);
         } else if (EqualsNoCase(key, L"TintColor")) {
-            if (EqualsNoCase(val, L"accent")) outPreset.liveUsesAccent = true;
+            if (EqualsNoCase(val, L"theme")) { outPreset.liveUsesTheme = true; outPreset.liveUsesAccent = false; }
+            else if (EqualsNoCase(val, L"accent")) { outPreset.liveUsesAccent = true; outPreset.liveUsesTheme = false; }
             else if (ParseHexColor(val, &outPreset.r, &outPreset.g, &outPreset.b, &outPreset.a))
-                outPreset.liveUsesAccent = false;
+                { outPreset.liveUsesAccent = false; outPreset.liveUsesTheme = false; }
             else Wh_Log(L"BackdropStyle: bad TintColor '%s'", val.c_str());
         } else if (EqualsNoCase(key, L"FallbackColor")) {
-            if (EqualsNoCase(val, L"accent")) outPreset.fallbackUsesAccent = true;
+            if (EqualsNoCase(val, L"theme")) { outPreset.fallbackUsesTheme = true; outPreset.fallbackUsesAccent = false; }
+            else if (EqualsNoCase(val, L"accent")) { outPreset.fallbackUsesAccent = true; outPreset.fallbackUsesTheme = false; }
             else if (ParseHexColor(val, &outPreset.fr, &outPreset.fg, &outPreset.fb, &outPreset.fa))
-                outPreset.fallbackUsesAccent = false;
+                { outPreset.fallbackUsesAccent = false; outPreset.fallbackUsesTheme = false; }
             else Wh_Log(L"BackdropStyle: bad FallbackColor '%s'", val.c_str());
         } else {
             Wh_Log(L"BackdropStyle: unknown attribute '%s'", key.c_str());
         }
     }
+}
+// Per-state transparency: lerps the tint alpha from its "rest" value toward a denser "focus"
+// value as `mix` (0 = rest, 1 = focus) rises, so hovering/opening the panel makes content behind
+// it easier to read. `preset.focusA` (the FocusOpacity= key) overrides the focus target for the
+// live tint; if unset, focus defaults to rest+0.25 (capped at 0.92). The fallback tint (already
+// dense) gets a smaller +0.10 bump, capped at 0.95.
+void ApplyStateOpacity(BackdropPreset& preset, float mix) {
+    const float focusLive = preset.focusA >= 0.0f ? preset.focusA : std::min(preset.a + 0.25f, 0.92f);
+    const float focusFallback = std::min(preset.fa + 0.10f, 0.95f);
+    preset.a += (focusLive - preset.a) * mix;
+    preset.fa += (focusFallback - preset.fa) * mix;
 }
 bool g_backdropBlurLive = false;  // render-thread only: did BackdropBlurHost deliver real blur this frame?
 
@@ -1028,6 +1075,7 @@ struct Settings {
     bool autoDpiScale = true;
     bool alwaysOnTop = true;
     float pillOpacity = 1.0f;
+    ThemeMode themeMode = ThemeMode::Auto;
     bool backdropEnabled = false;
     BackdropPreset backdrop{};  // parsed recipe; accent-flagged channels resolved per-frame
     std::wstring calendarIcsUrl;
@@ -1041,6 +1089,7 @@ struct Settings {
 Settings g_settings;
 std::mutex g_settingsMutex;
 std::atomic<bool> g_captureVolKeys{true};  // lock-free mirror of Settings.captureVolumeKeys for the LL key hook
+std::atomic<int> g_themeMode{static_cast<int>(ThemeMode::Auto)};  // lock-free mirror for LuminanceThreadProc
 
 void LoadSettings() {
     Settings next;
@@ -1060,6 +1109,12 @@ void LoadSettings() {
     next.alwaysOnTop = Wh_GetIntSetting(L"AlwaysOnTop") != 0;
     const std::wstring opacity = GetStringSettingCopy(L"PillOpacity");
     next.pillOpacity = opacity.empty() ? 1.0f : Clamp(static_cast<float>(_wtof(opacity.c_str())), 0.35f, 1.0f);
+    const std::wstring theme = GetStringSettingCopy(L"Theme");
+    if (EqualsNoCase(theme, L"dark")) next.themeMode = ThemeMode::Dark;
+    else if (EqualsNoCase(theme, L"light")) next.themeMode = ThemeMode::Light;
+    else if (EqualsNoCase(theme, L"adaptive")) next.themeMode = ThemeMode::Adaptive;
+    else next.themeMode = ThemeMode::Auto;
+    g_themeMode = static_cast<int>(next.themeMode);  // lock-free mirror for the luminance sampler
     ParseBackdropStyle(GetStringSettingCopy(L"BackdropStyle"), next.backdrop, next.backdropEnabled);
     next.calendarIcsUrl = GetStringSettingCopy(L"CalendarIcsUrl");
     next.calendarRefreshMinutes = ClampInt(Wh_GetIntSetting(L"CalendarRefreshMinutes"), 5, 240);
@@ -1098,8 +1153,11 @@ std::atomic<bool>  g_volMuted{false};
 std::atomic<bool>  g_volValid{false};
 double g_volSuppressPollUntil = 0.0;  // render-thread only
 
+
 HWND g_hwnd = nullptr;
 RECT g_pillRect = {};  // screen rect of the VISIBLE panel (not the window) — drives hover detection
+RECT g_volumeHotspotRect = {};  // screen rect of the mini volume element; empty when not Collapsed.
+                                 // Render-thread only (write + read), same as g_pillRect's un-locked read.
 SRWLOCK g_pillRectLock = SRWLOCK_INIT;  // guards cross-thread reads (luminance sampler); render thread is the only writer and reads it un-locked
 std::atomic<float> g_behindLum{-1.0f};  // mean luma [0..1] of the desktop around the panel; < 0 = no sample yet
 HANDLE g_stopEvent = nullptr;
@@ -1108,8 +1166,17 @@ HANDLE g_notifThread = nullptr;
 std::atomic<bool> g_layoutDirty{true};
 std::atomic<double> g_lastInputSec{-100.0};  // last pointer input; drives event-based repaint
 std::atomic<bool> g_waveWanted{false};       // true only when the live waveform is on screen
+constexpr double kHideSeconds = 15.0;  // temp-hide ceiling; auto-reshows sooner if the cursor leaves first
+double g_hideUntil = 0.0;              // render-thread only: middle-click temp-hide deadline (NowSeconds())
+RECT g_hideWatchRect = {};             // render-thread only: "territory" rect that keeps it hidden while occupied
 HHOOK g_dismissHook = nullptr;               // WH_MOUSE_LL: click-outside dismiss (on the input thread)
 std::atomic<bool> g_dismissActive{false};    // only act on the mouse hook while the panel is Open
+// The window doesn't resize/reposition to its Open dimensions atomically with g_dismissActive
+// flipping true -- there's a short window where the hook thread's GetWindowRect (in LlMouseProc)
+// can still see the OLD (small, pre-Open) rect and misjudge the very click that opened the panel
+// as "outside" it. Suppress outside-click dismissal for a brief grace period after opening.
+std::atomic<double> g_dismissArmedAt{0.0};
+constexpr double kDismissGraceSeconds = 0.25;
 HHOOK g_keyHook = nullptr;                    // WH_KEYBOARD_LL: volume-key capture
 HANDLE g_inputHookThread = nullptr;          // dedicated thread hosting BOTH low-level hooks
 DWORD g_inputHookTid = 0;
@@ -1121,6 +1188,44 @@ void TriggerNudge() {
     last = now;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_NEW_EVENT, 0, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Default audio device change watcher
+// ---------------------------------------------------------------------------
+// IAudioEndpointVolume/IAudioMeterInformation are bound to a SPECIFIC endpoint at Activate() time
+// and stay perfectly "valid" even after that endpoint stops being the system default -- so naive
+// caching (the original code) silently keeps controlling/metering whatever device WAS default
+// when it first connected, forever, even after the user switches output (e.g. connects
+// Bluetooth/AirPods and Windows flips the default render device). This tiny IMMNotificationClient
+// bumps a shared epoch on every default-render-device change; VolumeController and the audio
+// meter thread each compare against their own last-seen epoch and drop+re-resolve their cached
+// endpoint when it moves, at no extra cost on the (overwhelmingly common) unchanged case.
+std::atomic<uint64_t> g_audioDeviceEpoch{0};
+
+class AudioDeviceWatcher : public IMMNotificationClient {
+   public:
+    // Static-lifetime singleton (registered once, unregistered explicitly in VolumeController::
+    // Shutdown); refcounting is a formality the audio service expects, not real lifetime control.
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient)) {
+            *ppv = static_cast<IMMNotificationClient*>(this);
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole, LPCWSTR) override {
+        if (flow == eRender) g_audioDeviceEpoch.fetch_add(1, std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+};
+AudioDeviceWatcher g_audioWatcher;
 
 // ---------------------------------------------------------------------------
 // Volume controller (synchronous; push-callbacks added in a later stage)
@@ -1144,12 +1249,22 @@ class VolumeController {
         if (!Ensure()) return;
         vol_->SetMute(muted ? TRUE : FALSE, nullptr);
     }
+    // Unregister the device-change callback before the mod unloads -- a notification firing into
+    // an unloaded DLL would crash the host process.
+    void Shutdown() {
+        if (enum_) enum_->UnregisterEndpointNotificationCallback(&g_audioWatcher);
+        vol_.Reset(); device_.Reset(); enum_.Reset();
+    }
    private:
     bool Ensure() {
-        if (vol_) return true;
+        const uint64_t epoch = g_audioDeviceEpoch.load(std::memory_order_relaxed);
+        if (vol_ && epoch == lastEpoch_) return true;
+        vol_.Reset(); device_.Reset();  // stale endpoint (or first run) -- re-resolve the CURRENT default
+        lastEpoch_ = epoch;
         if (!enum_) {
             if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                         IID_PPV_ARGS(&enum_)))) return false;
+            enum_->RegisterEndpointNotificationCallback(&g_audioWatcher);
         }
         if (FAILED(enum_->GetDefaultAudioEndpoint(eRender, eConsole, &device_))) return false;
         if (FAILED(device_->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr,
@@ -1159,8 +1274,31 @@ class VolumeController {
     ComPtr<IMMDeviceEnumerator> enum_;
     ComPtr<IMMDevice> device_;
     ComPtr<IAudioEndpointVolume> vol_;
+    uint64_t lastEpoch_ = 0;
 };
 VolumeController g_volume;
+
+// Unified volume-set / mute-toggle path. Every caller that changes system volume -- the
+// Open-panel slider, the pill's mini volume element (drag/click), its scroll-wheel gesture, and
+// captured hardware volume keys -- funnels through these two, so there is exactly one place that
+// updates state, suppresses the native/PollVolume OSD, and pushes to the OS.
+void SetSystemVolume(float v) {
+    v = Clamp(v, 0.0f, 1.0f);
+    g_volScalar = v;
+    g_volMuted = false;
+    g_volSuppressPollUntil = NowSeconds() + 0.4;  // avoid a duplicate popup from PollVolume
+    g_volume.Set(v);
+    g_layoutDirty = true;
+}
+void ToggleSystemMute() {
+    float cur = 0.0f; bool mut = false;
+    g_volume.Get(cur, mut);
+    bool nm = !mut;
+    g_volume.SetMute(nm);
+    g_volMuted = nm;
+    g_volSuppressPollUntil = NowSeconds() + 0.4;
+    g_layoutDirty = true;
+}
 
 void ShowVolumeTransient(int pct, bool muted);  // defined in the transient section below
 
@@ -1446,11 +1584,23 @@ bool DecodeImageBytesToPixels(const std::vector<uint8_t>& bytes, BitmapPixels* o
 
 struct MediaState {
     bool active = false, playing = false;
-    std::wstring title, artist, aumid;
+    std::wstring title, artist, aumid, sourceName;
     int64_t posTicks = 0, endTicks = 0;  // 100ns
     ULONGLONG capturedTick = 0;
     BitmapPixels art;
 };
+// Maps a well-known AUMID to a friendly display name; empty if unrecognized (caller omits it).
+std::wstring FriendlyMediaSourceName(const std::wstring& aumid) {
+    auto has = [&](const wchar_t* needle) { return aumid.find(needle) != std::wstring::npos; };
+    if (has(L"Spotify")) return L"Spotify";
+    if (has(L"ZuneMusic") || has(L"Microsoft.Media.Player")) return L"Media Player";
+    if (has(L"MicrosoftEdge") || has(L"MSEdge")) return L"Edge";
+    if (has(L"Chrome")) return L"Chrome";
+    if (has(L"Firefox")) return L"Firefox";
+    if (has(L"VLC")) return L"VLC";
+    if (has(L"AppleMusic") || has(L"iTunes")) return L"Apple Music";
+    return L"";
+}
 std::mutex g_mediaMutex;
 MediaState g_media;
 MediaState MediaSnapshot() { std::lock_guard l(g_mediaMutex); return g_media; }
@@ -1468,8 +1618,16 @@ HANDLE g_audioThread = nullptr;
 DWORD WINAPI AudioThreadProc(void*) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     ComPtr<IMMDeviceEnumerator> en; ComPtr<IMMDevice> dev; ComPtr<IAudioMeterInformation> meter;
+    uint64_t lastEpoch = 0;
     auto ensure = [&]() -> bool {
-        if (meter) return true;
+        // Re-resolve against the CURRENT default render device whenever it changes (see
+        // AudioDeviceWatcher) -- otherwise the meter keeps reading whatever device WAS default
+        // (e.g. laptop speakers) even after the user switches to AirPods/Bluetooth, showing a dead
+        // waveform because that old device is no longer receiving any audio.
+        const uint64_t epoch = g_audioDeviceEpoch.load(std::memory_order_relaxed);
+        if (meter && epoch == lastEpoch) return true;
+        meter.Reset(); dev.Reset();
+        lastEpoch = epoch;
         if (!en && FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&en)))) return false;
         if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev))) return false;
         if (FAILED(dev->Activate(ICC_IID_IAudioMeterInformation, CLSCTX_ALL, nullptr, (void**)meter.GetAddressOf()))) { dev.Reset(); return false; }
@@ -1490,6 +1648,23 @@ DWORD WINAPI AudioThreadProc(void*) {
     return 0;
 }
 
+// Picks which GSMTC session represents "now playing": a session that's actually Playing first (so
+// an idle browser tab's media session can't shadow something genuinely playing, e.g. Spotify),
+// else the session the OS considers current, else whatever's first available. Shared by the
+// snapshot poll and MediaCommand so both always agree on which app is being reported/controlled.
+winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSession PickMediaSession(
+    const winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager& mgr) {
+    using namespace winrt::Windows::Media::Control;
+    using PS = GlobalSystemMediaTransportControlsSessionPlaybackStatus;
+    if (!mgr) return nullptr;
+    auto sessions = mgr.GetSessions();
+    for (auto const& sess : sessions)
+        if (sess.GetPlaybackInfo().PlaybackStatus() == PS::Playing) return sess;
+    if (auto cur = mgr.GetCurrentSession()) return cur;
+    for (auto const& sess : sessions) return sess;
+    return nullptr;
+}
+
 DWORD WINAPI MediaThreadProc(void*) {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     using namespace winrt::Windows::Media::Control;
@@ -1500,7 +1675,7 @@ DWORD WINAPI MediaThreadProc(void*) {
         try {
             if (!mgr) mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
             if (mgr) {
-                auto s = mgr.GetCurrentSession();
+                auto s = PickMediaSession(mgr);
                 if (s) {
                     auto props = s.TryGetMediaPropertiesAsync().get();
                     auto pb = s.GetPlaybackInfo();
@@ -1510,6 +1685,7 @@ DWORD WINAPI MediaThreadProc(void*) {
                     next.title = props.Title().c_str();
                     next.artist = props.Artist().c_str();
                     next.aumid = s.SourceAppUserModelId().c_str();
+                    next.sourceName = FriendlyMediaSourceName(next.aumid);
                     if (tl) { next.posTicks = tl.Position().count(); next.endTicks = tl.EndTime().count(); next.capturedTick = GetTickCount64(); }
                     if (auto th = props.Thumbnail()) {
                         auto bytes = ReadWinRtStreamBytes(th);
@@ -1534,18 +1710,13 @@ DWORD WINAPI MediaThreadProc(void*) {
 }
 
 void MediaCommand(int cmd) {  // 0 prev, 1 toggle, 2 next
-    std::wstring aumid; { std::lock_guard l(g_mediaMutex); aumid = g_media.aumid; }
-    std::thread([cmd, aumid] {
+    std::thread([cmd] {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
         try {
             using namespace winrt::Windows::Media::Control;
             auto mgr = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
-            if (mgr) {
-                auto s = mgr.GetCurrentSession();
-                for (auto const& sess : mgr.GetSessions())
-                    if (std::wstring(sess.SourceAppUserModelId().c_str()) == aumid) { s = sess; break; }
-                if (s) { if (cmd == 0) s.TrySkipPreviousAsync().get(); else if (cmd == 1) s.TryTogglePlayPauseAsync().get(); else if (cmd == 2) s.TrySkipNextAsync().get(); }
-            }
+            auto s = PickMediaSession(mgr);  // same selection as the poll -- always targets what's shown
+            if (s) { if (cmd == 0) s.TrySkipPreviousAsync().get(); else if (cmd == 1) s.TryTogglePlayPauseAsync().get(); else if (cmd == 2) s.TrySkipNextAsync().get(); }
         } catch (...) {}
         winrt::uninit_apartment();
     }).detach();
@@ -1767,6 +1938,12 @@ DWORD WINAPI LuminanceThreadProc(void*) {
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     float ema = -1.0f;
     while (WaitForSingleObject(g_stopEvent, 300) == WAIT_TIMEOUT) {
+        // Only Theme=adaptive consumes this sample; idle (and clear any stale value) otherwise
+        // so switching away from adaptive can't leave a frozen ghost reading behind.
+        if (g_themeMode.load() != static_cast<int>(ThemeMode::Adaptive)) {
+            if (ema >= 0.0f) { ema = -1.0f; g_behindLum = -1.0f; }
+            continue;
+        }
         AcquireSRWLockShared(&g_pillRectLock);
         const RECT pill = g_pillRect;
         ReleaseSRWLockShared(&g_pillRectLock);
@@ -1981,6 +2158,182 @@ struct Slider : Widget {
     }
    private:
     float pendingX_ = -1.0f;
+};
+
+// Forward declarations: definitions live near BuildRoot, alongside the rest of the pill-content
+// helpers (TimeString/DatePillString/weather); CollapsedPill (below) needs them earlier.
+std::wstring TimeString();
+std::wstring DatePillString();
+bool WeatherFresh();
+std::wstring WeatherShort();
+
+// Draws album art (or a placeholder glyph) clipped to a CIRCLE inscribed in `rect` -- shared by
+// CollapsedPill, the Expanded hover-peek's now-playing row, and the Open panel's MediaCard, so
+// there's exactly one place that decides how art is masked. Uses a bitmap brush + FillEllipse
+// (cover-fit: scaled up and centered so the circle is fully covered, cropping any excess) rather
+// than DrawBitmap, since DrawBitmap always paints a plain rectangle regardless of any fill shape.
+void DrawCircularArt(DrawContext& dc, D2D1_RECT_F rect, IDWriteTextFormat* placeholderGlyphFmt) {
+    const D2D1_POINT_2F center = D2D1::Point2F((rect.left + rect.right) * 0.5f, (rect.top + rect.bottom) * 0.5f);
+    const float radius = std::min(W(rect), H(rect)) * 0.5f;
+    if (dc.artBmp) {
+        D2D1_SIZE_F sz = dc.artBmp->GetSize();
+        if (sz.width > 0.0f && sz.height > 0.0f) {
+            const float cover = std::max(W(rect) / sz.width, H(rect) / sz.height);
+            D2D1::Matrix3x2F xform = D2D1::Matrix3x2F::Scale(cover, cover) *
+                D2D1::Matrix3x2F::Translation(center.x - sz.width * cover * 0.5f,
+                                              center.y - sz.height * cover * 0.5f);
+            ComPtr<ID2D1BitmapBrush> brush;
+            dc.dc->CreateBitmapBrush(
+                dc.artBmp,
+                D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP),
+                D2D1::BrushProperties(1.0f, xform), &brush);
+            if (brush) { dc.dc->FillEllipse(D2D1::Ellipse(center, radius, radius), brush.Get()); return; }
+        }
+    }
+    dc.card->SetOpacity(0.15f);
+    dc.dc->FillEllipse(D2D1::Ellipse(center, radius, radius), dc.card);
+    dc.card->SetOpacity(1.0f);
+    if (placeholderGlyphFmt) dc.Text(L"\xE8D6", placeholderGlyphFmt, rect, dc.muted, 0.6f, DWRITE_TEXT_ALIGNMENT_CENTER);
+}
+
+// --- CollapsedPill: clock/date + weather + a mini volume element --------------
+// Replaces the old plain divider between the clock and weather with a tiny speaker glyph +
+// vertical fill track showing/controlling system volume. It is the pill's ONLY clickable/
+// draggable region while collapsed -- HitTestDeep returns null everywhere else on the pill so a
+// plain click still falls through to Surface::Open() (see the relaxed OnDown guard below).
+struct CollapsedPill : Widget {
+    float Measure(const DrawContext& dc, float) override { return 50.0f * dc.scale; }
+    float PreferredWidth(const DrawContext& dc) override {
+        const float s = dc.scale;
+        MediaState m = MediaSnapshot();
+        float leftW = std::max(dc.MeasureWidth(dc.fPill, TimeString()),
+                               dc.MeasureWidth(dc.fPillSub, DatePillString()));
+        float total = 16.0f * s + leftW + 12.0f * s + kGlyphW * s + 6.0f * s + kTrackW * s + 12.0f * s;
+        if (WeatherFresh()) total += 12.0f * s + dc.MeasureWidth(dc.fPill, WeatherShort());
+        total += 16.0f * s;
+        // Now-playing indicator: album art prepended on the left, a live waveform appended on
+        // the right while actually playing -- both widen the pill (it glides to the new width via
+        // the render loop's normal spring, no separate animation needed here).
+        if (m.active) {
+            total += kArtSize * s + kArtGap * s;
+            if (m.playing) total += kArtGap * s + kWaveW * s;
+        }
+        return total;
+    }
+    Widget* HitTestDeep(D2D1_POINT_2F p) override {
+        if (!visible) return nullptr;
+        return (p.x >= hotspot_.left && p.x < hotspot_.right &&
+                p.y >= hotspot_.top && p.y < hotspot_.bottom) ? this : nullptr;
+    }
+    bool OnPointer(const PointerEvent& e, bool& wantsCapture) override {
+        wantsCapture = false;
+        if (e.phase == PointerPhase::Down) {
+            dragging_ = true; wantsCapture = true; startY_ = e.pos.y; moved_ = false; pendingY_ = -1.0f;
+            return true;
+        }
+        if (e.phase == PointerPhase::Move && dragging_) {
+            if (!moved_ && std::fabs(e.pos.y - startY_) > 3.0f) moved_ = true;
+            if (moved_) pendingY_ = e.pos.y;
+            return true;
+        }
+        if (e.phase == PointerPhase::Up && dragging_) {
+            dragging_ = false;
+            if (moved_) pendingY_ = e.pos.y;
+            else ToggleSystemMute();  // a clean click (no drag) toggles mute
+            return true;
+        }
+        return false;
+    }
+    bool HasPending() const { return pendingY_ >= 0.0f; }
+    float TakePending() { float y = pendingY_; pendingY_ = -1.0f; return y; }
+    void Apply(float y) {
+        float trackH = std::max(1.0f, H(trackRect_));
+        SetSystemVolume((trackRect_.bottom - y) / trackH);
+    }
+    D2D1_RECT_F Hotspot() const { return hotspot_; }
+
+    void Paint(DrawContext& dc) override {
+        const float s = dc.scale;
+        const D2D1_RECT_F b = bounds;
+        MediaState m = MediaSnapshot();
+        const float leftW = std::max(dc.MeasureWidth(dc.fPill, TimeString()),
+                                     dc.MeasureWidth(dc.fPillSub, DatePillString()));
+        const bool wx = WeatherFresh();
+        const float weatherW = wx ? dc.MeasureWidth(dc.fPill, WeatherShort()) : 0.0f;
+        const float glyphW = kGlyphW * s, trackW = kTrackW * s;
+        float contentW = leftW + 12.0f * s + glyphW + 6.0f * s + trackW + 12.0f * s;
+        if (wx) contentW += 12.0f * s + weatherW;
+        const bool showArt = m.active;
+        const bool showWave = m.active && m.playing;
+        float totalW = contentW;
+        if (showArt) totalW += kArtSize * s + kArtGap * s;
+        if (showWave) totalW += kArtGap * s + kWaveW * s;
+        const float blockX0 = b.left + (W(b) - totalW) * 0.5f;  // start of the whole centered block
+        const float lx = blockX0 + (showArt ? kArtSize * s + kArtGap * s : 0.0f);  // time/date start
+
+        if (showArt) {
+            D2D1_RECT_F art = D2D1::RectF(blockX0, b.top + 8.0f * s, blockX0 + kArtSize * s, b.top + 8.0f * s + kArtSize * s);
+            DrawCircularArt(dc, art, dc.fGlyph);
+        }
+
+        dc.Text(TimeString(), dc.fPill, D2D1::RectF(lx, b.top + 8.0f * s, lx + leftW, b.top + 29.0f * s),
+                dc.text, 0.96f, DWRITE_TEXT_ALIGNMENT_CENTER);
+        dc.Text(DatePillString(), dc.fPillSub, D2D1::RectF(lx, b.top + 27.0f * s, lx + leftW, b.top + 41.0f * s),
+                dc.muted, 0.85f, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        const float glyphX = lx + leftW + 12.0f * s;
+        const bool muted = g_volMuted.load();
+        dc.Text(muted ? L"\xE74F" : L"\xE767", dc.fGlyph,
+                D2D1::RectF(glyphX, b.top, glyphX + glyphW, b.bottom), dc.text, 0.85f,
+                DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        const float trackX = glyphX + glyphW + 6.0f * s;
+        D2D1_RECT_F tr = D2D1::RectF(trackX, b.top + 13.0f * s, trackX + trackW, b.bottom - 13.0f * s);
+        trackRect_ = tr;
+        const float rad = trackW * 0.5f;
+        dc.dc->FillRoundedRectangle(D2D1::RoundedRect(tr, rad, rad), dc.track);
+        const float vol = Clamp(g_volDisplayScalar.load(), 0.0f, 1.0f);
+        const float fillTop = tr.bottom - H(tr) * vol;
+        if (fillTop < tr.bottom - 0.5f)
+            dc.dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tr.left, fillTop, tr.right, tr.bottom), rad, rad),
+                                        dc.accent);
+        // Hotspot spans the full pill height (generous vertical target) but stays narrow
+        // horizontally so it doesn't swallow clicks meant for the clock, weather, or art/waveform.
+        hotspot_ = D2D1::RectF(glyphX - 4.0f * s, b.top, trackX + trackW + 4.0f * s, b.bottom);
+
+        float afterX = trackX + trackW;
+        if (wx) {
+            const float wxX = afterX + 12.0f * s;
+            dc.Text(WeatherShort(), dc.fPill, D2D1::RectF(wxX, b.top, wxX + weatherW, b.bottom), dc.text, 0.92f,
+                    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+                    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            afterX = wxX + weatherW;
+        }
+
+        if (showWave) {
+            const float waveX = afterX + kArtGap * s;
+            D2D1_RECT_F wf = D2D1::RectF(waveX, b.top + 17.0f * s, waveX + kWaveW * s, b.bottom - 17.0f * s);
+            int wcount; auto wave = WaveSnapshot(wcount);
+            const int bars = 8; const float bw = W(wf) / bars;
+            for (int i = 0; i < bars; ++i) {
+                int idx = wcount - bars + i;
+                float v = idx >= 0 ? wave[((idx % kWaveN) + kWaveN) % kWaveN] : 0.0f;
+                float hgt = std::max(1.0f, v * H(wf));
+                float x = wf.left + i * bw;
+                dc.accent->SetOpacity(0.4f + 0.6f * v);
+                dc.dc->FillRectangle(D2D1::RectF(x, wf.bottom - hgt, x + bw * 0.6f, wf.bottom), dc.accent);
+            }
+            dc.accent->SetOpacity(1.0f);
+        }
+    }
+
+   private:
+    static constexpr float kGlyphW = 16.0f, kTrackW = 4.0f, kArtSize = 34.0f, kArtGap = 10.0f, kWaveW = 40.0f;
+    D2D1_RECT_F hotspot_{};
+    D2D1_RECT_F trackRect_{};
+    bool dragging_ = false, moved_ = false;
+    float startY_ = 0.0f;
+    float pendingY_ = -1.0f;
 };
 
 // --- Button ------------------------------------------------------------------
@@ -2226,9 +2579,16 @@ struct AgendaList : Widget {
     }
 };
 
+std::wstring FormatMediaTime(double sec) {
+    if (sec < 0) sec = 0;
+    int total = (int)(sec + 0.5);
+    wchar_t buf[16]; swprintf_s(buf, L"%d:%02d", total / 60, total % 60);
+    return buf;
+}
+
 // --- MediaCard (now playing: art, transport, scrub, live waveform) -----------
 struct MediaCard : Widget {
-    float Measure(const DrawContext& dc, float) override { return 112.0f * dc.scale; }
+    float Measure(const DrawContext& dc, float) override { return 128.0f * dc.scale; }
 
     D2D1_RECT_F SeekRect(float s) const {
         return D2D1::RectF(bounds.left + 12 * s, bounds.bottom - 15 * s, bounds.right - 12 * s, bounds.bottom - 11 * s);
@@ -2266,14 +2626,13 @@ struct MediaCard : Widget {
         dc.card->SetOpacity(0.06f); dc.dc->FillRoundedRectangle(rr, dc.card); dc.card->SetOpacity(1.0f);
 
         D2D1_RECT_F art = D2D1::RectF(bounds.left + 10 * s, bounds.top + 10 * s, bounds.left + 74 * s, bounds.top + 74 * s);
-        if (dc.artBmp) dc.dc->DrawBitmap(dc.artBmp, art);
-        else { dc.card->SetOpacity(0.12f); dc.dc->FillRoundedRectangle(D2D1::RoundedRect(art, 8 * s, 8 * s), dc.card); dc.card->SetOpacity(1.0f);
-               dc.Text(L"\xE8D6", dc.fGlyph ? dc.fGlyph : dc.fTitle, art, dc.muted, 0.6f, DWRITE_TEXT_ALIGNMENT_CENTER); }
+        DrawCircularArt(dc, art, dc.fGlyph ? dc.fGlyph : dc.fTitle);
 
         float tx = bounds.left + 84 * s;
         dc.Text(m.title.empty() ? L"Nothing playing" : m.title, dc.fTitle,
                 D2D1::RectF(tx, bounds.top + 12 * s, bounds.right - 12 * s, bounds.top + 34 * s), dc.text, 0.95f);
-        dc.Text(m.artist, dc.fSmall, D2D1::RectF(tx, bounds.top + 34 * s, bounds.right - 12 * s, bounds.top + 52 * s), dc.muted, 0.8f);
+        std::wstring artistLine = m.sourceName.empty() ? m.artist : m.artist + L"  \x00B7  " + m.sourceName;
+        dc.Text(artistLine, dc.fSmall, D2D1::RectF(tx, bounds.top + 34 * s, bounds.right - 12 * s, bounds.top + 52 * s), dc.muted, 0.8f);
 
         // Live waveform strip.
         int wcount; auto wave = WaveSnapshot(wcount);
@@ -2303,6 +2662,12 @@ struct MediaCard : Widget {
         float frac = (seeking_ && pendingFrac_ >= 0) ? pendingFrac_ : (durSec > 0 ? Clamp((float)(posSec / durSec), 0.0f, 1.0f) : 0.0f);
         D2D1_RECT_F fill = sk; fill.right = sk.left + W(sk) * frac;
         dc.dc->FillRoundedRectangle(D2D1::RoundedRect(fill, rad, rad), dc.accent);
+
+        if (durSec > 0) {
+            D2D1_RECT_F tr = D2D1::RectF(sk.left, sk.top - 16 * s, sk.right, sk.top - 2 * s);
+            dc.Text(FormatMediaTime(posSec), dc.fSmall, tr, dc.muted, 0.7f, DWRITE_TEXT_ALIGNMENT_LEADING);
+            dc.Text(L"-" + FormatMediaTime(durSec - posSec), dc.fSmall, tr, dc.muted, 0.7f, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
     }
    private:
     float lastScale_ = 1.0f;
@@ -2526,7 +2891,7 @@ class Renderer {
     // current size from its top-left — this eliminates the per-frame CreateDIBSection realloc +
     // shrink/grow GDI churn that made resizing choppy. Returns the inner content rect.
     bool BeginFrame(const Settings& settings, const BackdropPreset& backdrop, int contentW, int contentH,
-                    int targetW, int targetH, bool settled, float scale, D2D1_RECT_F& innerOut) {
+                    int targetW, int targetH, bool settled, float scale, float themeT, D2D1_RECT_F& innerOut) {
         const float padX = kRenderPadX * scale, padY = kRenderPadY * scale;
         const int pxW = std::max(1, static_cast<int>(std::ceil(contentW + padX * 2.0f)));  // present
         const int pxH = std::max(1, static_cast<int>(std::ceil(contentH + padY * 2.0f)));
@@ -2559,42 +2924,18 @@ class Renderer {
             else
                 bPanel_->SetColor(D2D1::ColorF(backdrop.fr, backdrop.fg, backdrop.fb, backdrop.fa));
         }
-        // --- Adaptive text theme --------------------------------------------------------------
-        // What the user reads against = the desktop behind the panel (sampled around it by
-        // LuminanceThreadProc; Gaussian blur preserves mean luminance) composited with the active
-        // tint. Hysteresis (dark text above 0.52, light text below 0.44) + a 1s minimum dwell +
-        // a short fade keep video playing behind the island from ever strobing the text.
-        {
-            const double tnow = NowSeconds();
-            const float behind = g_behindLum.load();
-            if (behind >= 0.0f && tnow - themeFlipAt_ > 1.0) {
-                const float a0 = g_backdropBlurLive ? backdrop.a : backdrop.fa;
-                const float tintR = g_backdropBlurLive ? backdrop.r : backdrop.fr;
-                const float tintG = g_backdropBlurLive ? backdrop.g : backdrop.fg;
-                const float tintB = g_backdropBlurLive ? backdrop.b : backdrop.fb;
-                // PillOpacity thins the solid panel (EndFrame applies it only when the backdrop
-                // is disabled), letting more desktop through — fold it into the tint alpha.
-                const float a =
-                    settings.backdropEnabled ? a0 : a0 * Clamp(settings.pillOpacity, 0.35f, 1.0f);
-                const float tintLum = 0.299f * tintR + 0.587f * tintG + 0.114f * tintB;
-                const float surface = behind * (1.0f - a) + tintLum * a;
-                if (!themeDark_ && surface > 0.52f) { themeDark_ = true; themeFlipAt_ = tnow; }
-                else if (themeDark_ && surface < 0.44f) { themeDark_ = false; themeFlipAt_ = tnow; }
-            }
-            const float target = themeDark_ ? 1.0f : 0.0f;
-            const float dt = themeTickAt_ < 0.0 ? (1.0f / 60.0f)
-                                                : static_cast<float>(std::min(tnow - themeTickAt_, 0.1));
-            themeTickAt_ = tnow;
-            themeT_ += (target - themeT_) * (1.0f - std::exp(-dt / 0.08f));  // ~250ms fade
-            if (std::fabs(themeT_ - target) < 0.004f) themeT_ = target;
-        }
-        ApplyThemeBrushes(themeT_);
+        // Foreground palette follows the theme position computed by the caller's ThemeEngine
+        // (auto/dark/light/adaptive) BEFORE this frame — see the render loop.
+        ApplyThemeBrushes(themeT);
         target_->BeginDraw();
         target_->Clear(D2D1::ColorF(0, 0.0f));
         innerOut = D2D1::RectF(padX, padY, (float)bitmapWidth_ - padX, (float)bitmapHeight_ - padY);
         return true;
     }
-    bool EndFrame(const Settings& settings) {
+    // `visibility` is the temp-hide fade (1 = fully visible, 0 = fully hidden); folded in
+    // multiplicatively alongside PillOpacity/BackdropStyle so hiding fades the ENTIRE island
+    // (panel + content) smoothly rather than an abrupt show/hide.
+    bool EndFrame(const Settings& settings, float visibility) {
         if (FAILED(target_->EndDraw())) return false;
         POINT src = {0, 0};
         SIZE size = {presentW_, presentH_};  // present the current size from the DIB's top-left
@@ -2605,7 +2946,7 @@ class Renderer {
         // PillOpacity and a BackdropStyle's own tint alpha must not compound (they were multiplying,
         // making backdrop styles look far more washed out than their tint alone suggests). PillOpacity
         // only applies to the plain solid panel (backdrop disabled); an active style's tint is authoritative.
-        float finalAlpha = !settings.backdropEnabled ? Clamp(settings.pillOpacity, 0.35f, 1.0f) : 1.0f;
+        float finalAlpha = (!settings.backdropEnabled ? Clamp(settings.pillOpacity, 0.35f, 1.0f) : 1.0f) * visibility;
         blend.SourceConstantAlpha = static_cast<BYTE>(finalAlpha * 255.0f);
         blend.AlphaFormat = AC_SRC_ALPHA;
         return UpdateLayeredWindow(hwnd_, nullptr, &dst, &size, memDc_, &src, 0, &blend, ULW_ALPHA) != FALSE;
@@ -2617,10 +2958,6 @@ class Renderer {
         target_->FillRoundedRectangle(rr, bPanel_.Get());
         target_->DrawRoundedRectangle(rr, bBorder_.Get(), 1.0f);
     }
-
-    // True while the adaptive text theme is mid-fade — the render loop keeps 60fps pacing until
-    // the palette lands (themeT_ snaps exactly to its target when it arrives, so == is safe).
-    bool ThemeAnimating() const { return themeT_ != (themeDark_ ? 1.0f : 0.0f); }
 
    private:
     void PositionOverlayWindow(const Settings& s, int width, int height);
@@ -2684,9 +3021,11 @@ class Renderer {
     // BackdropStyle recipe).
     struct ThemeColor { float r, g, b, a; };
     struct ThemePalette { ThemeColor text, muted, card, border, divider, track; };
+    // Dark theme's border (0x20FFFFFF, alpha 0x20/255) matches the windows-11-taskbar-styler
+    // mod's own WindowGlass border color exactly.
     static constexpr ThemePalette kThemes[2] = {
         {{1, 1, 1, 0.96f}, {1, 1, 1, 0.62f}, {1, 1, 1, 1.0f},
-         {1, 1, 1, 0.10f}, {1, 1, 1, 0.12f}, {1, 1, 1, 0.16f}},
+         {1, 1, 1, 0.125f}, {1, 1, 1, 0.12f}, {1, 1, 1, 0.16f}},
         {{0.05f, 0.05f, 0.07f, 0.95f}, {0.07f, 0.07f, 0.09f, 0.60f}, {0, 0, 0, 1.0f},
          {0, 0, 0, 0.16f}, {0, 0, 0, 0.16f}, {0, 0, 0, 0.20f}},
     };
@@ -2731,10 +3070,6 @@ class Renderer {
     int bitmapWidth_ = 0, bitmapHeight_ = 0;   // allocated DIB size (may exceed the presented size)
     int presentW_ = 0, presentH_ = 0;          // size actually shown via UpdateLayeredWindow
     float lastScale_ = 0.0f;
-    bool themeDark_ = false;      // current side of the theme hysteresis (true = dark-on-light)
-    float themeT_ = 0.0f;         // animated palette position: 0 light-on-dark .. 1 dark-on-light
-    double themeFlipAt_ = -10.0;  // last hysteresis flip (enforces the minimum dwell)
-    double themeTickAt_ = -1.0;   // last fade tick (frame-rate independent easing)
 };
 
 // ---------------------------------------------------------------------------
@@ -2811,14 +3146,22 @@ LRESULT CALLBACK BlurHostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-// Render-thread only: the live Windows accent color (+ a pre-darkened ramp variant for the
-// no-blur fallback tint), cached and polled every 2s — theme changes are rare, querying
-// UISettings 60x/second for a value that almost never changes would be wasteful. Reuses the
-// render thread's existing COM apartment (CoInitializeEx in RenderThreadProc; no separate
-// winrt::init_apartment needed — the same apartment already backs the Compositor calls above).
-struct AccentColors { float r = 0.20f, g = 0.55f, b = 1.0f, dr = 0.11f, dg = 0.31f, db = 0.57f; };
-AccentColors GetAccentColorsCached() {
-    static AccentColors cached;
+// Render-thread only: live Windows theme colors -- accent (+ a pre-darkened ramp for the no-blur
+// fallback tint) and the system chrome/background color -- cached and polled every 2s (theme
+// changes are rare; querying UISettings 60x/second for values that almost never change would be
+// wasteful). Reuses the render thread's existing COM apartment (CoInitializeEx in
+// RenderThreadProc; no separate winrt::init_apartment needed). Deliberately the SAME detection
+// mechanism the windows-11-taskbar-styler mod uses (WinRT UISettings, not a registry poll) --
+// its WindowGlass background is itself a `{ThemeResource ...}` system chrome color, not a fixed
+// hex value, so matching it means tracking the same live system color rather than picking our own.
+struct SystemColors {
+    float r = 0.20f, g = 0.55f, b = 1.0f;                      // accent
+    float dr = 0.11f, dg = 0.31f, db = 0.57f;                  // accent, darkened (fallback-tint ramp)
+    float chromeR = 0.13f, chromeG = 0.13f, chromeB = 0.145f;  // live system chrome/background color
+    bool isLight = true;
+};
+SystemColors GetSystemColorsCached() {
+    static SystemColors cached;
     static double checkedAt = -10.0;
     const double now = NowSeconds();
     if (now - checkedAt > 2.0) {
@@ -2832,7 +3175,13 @@ AccentColors GetAccentColorsCached() {
             };
             auto acc = toF(us.GetColorValue(UIColorType::Accent));
             auto dark = toF(us.GetColorValue(UIColorType::AccentDark2));
-            cached = {acc[0], acc[1], acc[2], dark[0], dark[1], dark[2]};
+            auto bg = toF(us.GetColorValue(UIColorType::Background));
+            cached.r = acc[0]; cached.g = acc[1]; cached.b = acc[2];
+            cached.dr = dark[0]; cached.dg = dark[1]; cached.db = dark[2];
+            cached.chromeR = bg[0]; cached.chromeG = bg[1]; cached.chromeB = bg[2];
+            // Background's own luminance tells us which side is currently active (a light chrome
+            // color IS the light theme) -- the same signal ThemeResource colors track internally.
+            cached.isLight = (0.299f * bg[0] + 0.587f * bg[1] + 0.114f * bg[2]) > 0.5f;
         } catch (...) {}  // keep the last-known (or default) colors on failure
     }
     return cached;
@@ -2841,10 +3190,100 @@ AccentColors GetAccentColorsCached() {
 // color. Never mutates the shared Settings recipe -- callers pass their own per-frame copy.
 void ResolveAccentColors(BackdropPreset& preset) {
     if (!preset.liveUsesAccent && !preset.fallbackUsesAccent) return;
-    AccentColors ac = GetAccentColorsCached();
-    if (preset.liveUsesAccent) { preset.r = ac.r; preset.g = ac.g; preset.b = ac.b; }
-    if (preset.fallbackUsesAccent) { preset.fr = ac.dr; preset.fg = ac.dg; preset.fb = ac.db; }
+    SystemColors sc = GetSystemColorsCached();
+    if (preset.liveUsesAccent) { preset.r = sc.r; preset.g = sc.g; preset.b = sc.b; }
+    if (preset.fallbackUsesAccent) { preset.fr = sc.dr; preset.fg = sc.dg; preset.fb = sc.db; }
 }
+// Fills any theme-flagged channel with a neutral shade lerped by the eased theme position
+// (0 = dark neutral, 1 = light neutral) -- the "theme" TintColor/FallbackColor keyword, and the
+// default for both. Takes themeT explicitly (rather than reading g_themeEngine itself) so the
+// caller controls ordering: this must run AFTER ThemeEngine::Step produces this frame's value.
+// The CURRENTLY active side uses the live system chrome color (an exact match for the taskbar
+// styler's own ThemeResource-based background); the other side -- only ever visible transiently,
+// mid theme-change fade, since UISettings can't expose "what light mode would look like" while
+// dark mode is active -- falls back to the well-known Windows 11 default for that mode.
+void ResolveThemeColors(BackdropPreset& preset, float themeT) {
+    if (!preset.liveUsesTheme && !preset.fallbackUsesTheme) return;
+    constexpr float kDarkFallback[3] = {0.125f, 0.125f, 0.125f};   // Win11 dark chrome (~#202020)
+    constexpr float kLightFallback[3] = {0.953f, 0.953f, 0.953f};  // Win11 light chrome (~#F3F3F3)
+    SystemColors sc = GetSystemColorsCached();
+    const float dr = sc.isLight ? kDarkFallback[0] : sc.chromeR;
+    const float dg = sc.isLight ? kDarkFallback[1] : sc.chromeG;
+    const float db = sc.isLight ? kDarkFallback[2] : sc.chromeB;
+    const float lr = sc.isLight ? sc.chromeR : kLightFallback[0];
+    const float lg = sc.isLight ? sc.chromeG : kLightFallback[1];
+    const float lb = sc.isLight ? sc.chromeB : kLightFallback[2];
+    const float tr = dr + (lr - dr) * themeT, tg = dg + (lg - dg) * themeT, tb = db + (lb - db) * themeT;
+    if (preset.liveUsesTheme) { preset.r = tr; preset.g = tg; preset.b = tb; }
+    if (preset.fallbackUsesTheme) { preset.fr = tr; preset.fg = tg; preset.fb = tb; }
+}
+// Same detection mechanism (and thus the same behavior) as the windows-11-taskbar-styler mod:
+// WinRT UISettings, not a registry poll -- reuses the 2s-cached system-colors query above.
+bool SystemPrefersLight() { return GetSystemColorsCached().isLight; }
+
+// ===========================================================================
+// Theme engine
+// ===========================================================================
+// Resolves the Theme setting (auto/dark/light/adaptive) to a single smoothed position `themeT`
+// (0 = dark theme/white text, 1 = light theme/black text) that drives both the foreground
+// palette (Renderer::ApplyThemeBrushes) and the "theme" tint keyword (ResolveThemeColors).
+// Render-thread only; replaces the old per-Renderer themeDark_/themeT_ hysteresis.
+class ThemeEngine {
+   public:
+    float Step(const Settings& s, const BackdropPreset& folded, double now) {
+        switch (s.themeMode) {
+            case ThemeMode::Dark: lightSide_ = false; break;
+            case ThemeMode::Light: lightSide_ = true; break;
+            case ThemeMode::Adaptive: StepAdaptive(s, folded, now); break;
+            default: lightSide_ = SystemPrefersLight(); break;  // Auto
+        }
+        const float target = lightSide_ ? 1.0f : 0.0f;
+        const float dt = tickAt_ < 0.0 ? (1.0f / 60.0f)
+                                        : static_cast<float>(std::min(now - tickAt_, 0.1));
+        tickAt_ = now;
+        // tau 0.35s -> a deliberately slow, smooth fade (~1.2s to fully settle), vs the old 0.08s.
+        t_ += (target - t_) * (1.0f - std::exp(-dt / 0.35f));
+        if (std::fabs(t_ - target) < 0.004f) t_ = target;
+        return t_;
+    }
+    bool Animating() const { return t_ != (lightSide_ ? 1.0f : 0.0f); }
+
+   private:
+    // Hysteresis (0.52 dark->light / 0.44 light->dark) on the reading surface, but a candidate
+    // flip must hold CONTINUOUSLY for 3s before it commits -- sliding a window across the pill
+    // for a second or two can no longer flip the theme (replaces the old 1s min-dwell).
+    void StepAdaptive(const Settings& s, const BackdropPreset& folded, double now) {
+        const float behind = g_behindLum.load();
+        if (behind < 0.0f) return;  // no sample yet -> hold the current side
+        // Feedback-loop fix: when the tint itself is theme-driven, the hysteresis input MUST be
+        // the raw background sample, not the composited surface -- a light theme tint at focus
+        // opacity reads as "light" over almost anything behind it, which would permanently latch
+        // light. Only fixed (accent/hex) tints are genuinely a different reading surface.
+        float surface = behind;
+        if (!folded.liveUsesTheme && !folded.fallbackUsesTheme) {
+            const float a0 = g_backdropBlurLive ? folded.a : folded.fa;
+            const float tr = g_backdropBlurLive ? folded.r : folded.fr;
+            const float tg = g_backdropBlurLive ? folded.g : folded.fg;
+            const float tb = g_backdropBlurLive ? folded.b : folded.fb;
+            const float a = s.backdropEnabled ? a0 : a0 * Clamp(s.pillOpacity, 0.35f, 1.0f);
+            const float tintLum = 0.299f * tr + 0.587f * tg + 0.114f * tb;
+            surface = behind * (1.0f - a) + tintLum * a;
+        }
+        const bool desiredDiffers = (!lightSide_ && surface > 0.52f) || (lightSide_ && surface < 0.44f);
+        if (desiredDiffers) {
+            if (crossSince_ < 0.0) crossSince_ = now;
+            if (now - crossSince_ >= 3.0) { lightSide_ = !lightSide_; crossSince_ = -1.0; }
+        } else {
+            crossSince_ = -1.0;  // back inside the band (or already the committed side) -> cancel
+        }
+    }
+
+    bool lightSide_ = false;
+    float t_ = 0.0f;
+    double tickAt_ = -1.0;
+    double crossSince_ = -1.0;
+};
+ThemeEngine g_themeEngine;
 
 class BackdropBlurHost {
    public:
@@ -2891,6 +3330,13 @@ class BackdropBlurHost {
             lastRect_ = wr;
             shown_ = true;
         }
+    }
+
+    // Fades the blur visual itself in lockstep with the main window's own alpha (temp-hide) --
+    // without this the blur cuts instantly while the D2D panel/text keep fading, a visible seam
+    // between "background" (blur) and "foreground" (panel + content) during the hide animation.
+    void SetOpacity(float alpha) {
+        if (visual_) { try { visual_.Opacity(alpha); } catch (...) {} }
     }
 
     void Shutdown() {
@@ -3248,8 +3694,11 @@ class Surface {
             bool wc; captureTarget_->OnPointer(e, wc);
         }
     }
+    // Hit-tests unconditionally (not just when Open): outside Open, only CollapsedPill's mini
+    // volume hotspot ever returns a non-null, capture-requesting hit (a plain Custom leaf's base
+    // HitTestDeep returns itself but its OnPointer is unhandled) -- so a click anywhere else on
+    // the pill still comes back `handled=false` and the caller (WM_LBUTTONDOWN) opens the panel.
     bool OnDown(const PointerEvent& e) {
-        if (state != SurfaceState::Open) return false;  // clicks open the panel (handled by caller)
         Widget* hit = root_ ? root_->HitTestDeep(e.pos) : nullptr;
         pressTarget_ = hit;
         if (hit) {
@@ -3273,6 +3722,13 @@ class Surface {
         return false;
     }
     void OnWheel(const PointerEvent& e) {
+        // Anywhere over the hovered pill (Collapsed or the Expanded hover-peek) scrolls volume --
+        // reachable only while hovered/Open since the window is click-through otherwise (see
+        // SetClickThrough). The Open panel keeps its normal scroll-container routing.
+        if (state != SurfaceState::Open) {
+            SetSystemVolume(g_volScalar.load() + 0.02f * (e.wheel / 36.0f));  // 1 notch = 36 -> 2%
+            return;
+        }
         Widget* w = root_ ? root_->HitTestDeep(e.pos) : nullptr;
         while (w) {
             if (ScrollContainer* sc = w->AsScroll()) { sc->OnWheel(e.wheel); g_layoutDirty = true; return; }
@@ -3283,12 +3739,25 @@ class Surface {
 
     void ForEachSlider(const std::function<void(Slider*)>& fn) { ForEachSliderImpl(root_.get(), fn); }
 
-    // Drain any pending slider drag into a real value-set (needs dc.scale).
+    // Drain any pending slider/mini-volume drag into a real value-set (needs dc.scale for Slider).
     void FlushPendingDrag(const DrawContext& dc) {
-        if (auto* sl = dynamic_cast<Slider*>(captureTarget_ ? captureTarget_ : nullptr)) {
+        if (auto* sl = dynamic_cast<Slider*>(captureTarget_)) {
             if (sl->HasPending()) sl->Apply(dc, sl->TakePending());
+        } else if (auto* cp = dynamic_cast<CollapsedPill*>(captureTarget_)) {
+            if (cp->HasPending()) cp->Apply(cp->TakePending());
         }
     }
+    // Screen-space-free (window-content-space) hotspot of the collapsed pill's mini volume
+    // element, or an empty rect outside Collapsed -- lets the render loop hold the pill collapsed
+    // while the cursor is over it (see UpdateAmbientState) instead of instantly hover-expanding.
+    D2D1_RECT_F VolumeHotspot() const {
+        if (state != SurfaceState::Collapsed) return D2D1_RECT_F{};
+        if (auto* cp = dynamic_cast<CollapsedPill*>(root_.get())) return cp->Hotspot();
+        return D2D1_RECT_F{};
+    }
+    // The tallest the island could ever be (the Open panel, clamped to the monitor) -- used to
+    // build a generous "territory" rect for the temp-hide auto-reshow-on-mouse-leave logic.
+    float MaxPossibleHeight(const DrawContext& dc) const { return MaxOpenHeight(dc); }
 
     void Open() {
         if (state == SurfaceState::Open) return;
@@ -3300,11 +3769,22 @@ class Surface {
         pendingState_ = SurfaceState::Collapsed;
         RemoveDismissHook();
     }
-    // Drive Collapsed / TransientPopup / Expanded transitions (Open is click-driven).
-    void UpdateAmbientState(bool hovered, double now) {
-        if (state == SurfaceState::Open) return;
+    // Drive Collapsed / TransientPopup / Expanded transitions (Open is click-driven). Never rebuild
+    // while a widget is capturing (e.g. a mini-volume drag) -- BuildFor releases OS capture on any
+    // rebuild, so hover churn mid-drag would silently drop it. Also never clobber a JUST-QUEUED
+    // Open: WM_LBUTTONDOWN calls Open() (queuing pendingState_) then this runs later in the SAME
+    // frame, still seeing the OLD `state` (Collapsed) since ApplyPendingState hasn't run yet --
+    // without this check, a click on an already-hovered pill would queue Open only to have this
+    // immediately overwrite it back to Expanded, silently turning every click into a hover-peek.
+    void UpdateAmbientState(bool hovered, double now, bool overVolumeHotspot) {
+        if (state == SurfaceState::Open || IsCapturing()) return;
+        if (pendingState_.has_value() && *pendingState_ == SurfaceState::Open) return;
         if (hovered) {
             lastHoverTime_ = now;
+            // Hold Collapsed while the cursor is over the volume hotspot -- the instant hover
+            // expand would otherwise rebuild the tree (and the hotspot under it) before the user
+            // gets a chance to click or drag it.
+            if (state == SurfaceState::Collapsed && overVolumeHotspot) return;
             if (state != SurfaceState::Expanded) pendingState_ = SurfaceState::Expanded;
             return;
         }
@@ -3445,47 +3925,9 @@ std::vector<IcsEvent> NextUpcomingEvents(int maxN) {
 
 std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc) {
     if (s == SurfaceState::Collapsed) {
-        auto pill = std::make_unique<Custom>();
-        pill->fixedHeight = 50.0f * dc.scale;
-        // [ time / date ]  |  weather  — time is the hero with a small bold date sub-text beneath.
-        pill->prefWidth = [](const DrawContext& d) {
-            const float s = d.scale;
-            float leftW = std::max(d.MeasureWidth(d.fPill, TimeString()),
-                                   d.MeasureWidth(d.fPillSub, DatePillString()));
-            float total = 16.0f * s + leftW;
-            if (WeatherFresh())
-                total += 12.0f * s + 1.2f * s + 12.0f * s + d.MeasureWidth(d.fPill, WeatherShort());
-            return total + 16.0f * s;
-        };
-        pill->paint = [](DrawContext& d, D2D1_RECT_F b) {
-            const float s = d.scale;
-            float leftW = std::max(d.MeasureWidth(d.fPill, TimeString()),
-                                   d.MeasureWidth(d.fPillSub, DatePillString()));
-            // Compute the full content width and center it explicitly within b — robust to any
-            // drift between prefWidth's estimate and b's actual (spring-driven) width, so the
-            // time/date + weather block is always truly centered, not just left-anchored with
-            // matching margins that happen to line up.
-            float contentW = leftW;
-            bool wx = WeatherFresh();
-            if (wx) contentW += 12.0f * s + 1.2f * s + 12.0f * s + d.MeasureWidth(d.fPill, WeatherShort());
-            float lx = b.left + (W(b) - contentW) * 0.5f;
-            // Time/date stack, vertically centered as a unit within the pill with a tight gap.
-            d.Text(TimeString(), d.fPill, D2D1::RectF(lx, b.top + 8.0f * s, lx + leftW, b.top + 29.0f * s),
-                   d.text, 0.96f, DWRITE_TEXT_ALIGNMENT_CENTER);
-            d.Text(DatePillString(), d.fPillSub, D2D1::RectF(lx, b.top + 27.0f * s, lx + leftW, b.top + 41.0f * s),
-                   d.muted, 0.85f, DWRITE_TEXT_ALIGNMENT_CENTER);
-            if (wx) {
-                float x = lx + leftW + 12.0f * s;
-                d.dc->FillRectangle(D2D1::RectF(x, b.top + 13.0f * s, x + 1.2f * s, b.bottom - 13.0f * s), d.divider);
-                x += 1.2f * s + 12.0f * s;
-                std::wstring w = WeatherShort();
-                float ww = d.MeasureWidth(d.fPill, w);
-                d.Text(w, d.fPill, D2D1::RectF(x, b.top, x + ww, b.bottom), d.text, 0.92f,
-                       DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-                       D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-            }
-        };
-        return pill;
+        // [ time / date ]  |  volume glyph+track  |  weather — time is the hero with a small bold
+        // date sub-text beneath; the old plain divider is now the mini volume element.
+        return std::make_unique<CollapsedPill>();
     }
 
     if (s == SurfaceState::TransientPopup) {
@@ -3527,6 +3969,8 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
             int n = (int)NextUpcomingEvents(3).size();
             float h = 12.0f + 44.0f + 26.0f;      // pad + clock + date
             if (wf) h += 26.0f + 22.0f;           // weather main + detail line
+            h += 30.0f;                           // volume readout (always shown while hovering)
+            if (MediaSnapshot().active) h += 34.0f;  // compact now-playing row
             h += 10.0f + 1.0f + 10.0f + 20.0f;    // divider + "Up next" header
             h += (n > 0 ? n * 24.0f : 22.0f);     // event rows or empty state
             h += 12.0f;                           // bottom pad
@@ -3547,6 +3991,39 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
                 y += 26 * sc;
                 d.Text(WeatherDetail(), d.fSmall, D2D1::RectF(b.left, y, b.right, y + 18 * sc), d.muted, 0.7f, DWRITE_TEXT_ALIGNMENT_CENTER);
                 y += 22 * sc;
+            }
+            // Volume readout (read-only feedback, no click handling): always visible while
+            // hovering so a wheel-scroll here (Surface::OnWheel routes it while state != Open) is
+            // actually visible -- the Collapsed pill's draggable glyph+track is a much smaller
+            // target than "anywhere on the hovered pill", which is what scrolling responds to.
+            {
+                const bool muted = g_volMuted.load();
+                D2D1_RECT_F gr = D2D1::RectF(b.left + 20.0f * sc, y, b.left + 20.0f * sc + 22.0f * sc, y + 24.0f * sc);
+                d.Text(muted ? L"\xE74F" : L"\xE767", d.fGlyph, gr, d.accent, 0.9f, DWRITE_TEXT_ALIGNMENT_CENTER);
+                float shown = Clamp(g_volDisplayScalar.load(), 0.0f, 1.0f);
+                D2D1_RECT_F lr = D2D1::RectF(gr.right + 6.0f * sc, y + 1.0f * sc, b.right - 20.0f * sc, y + 15.0f * sc);
+                d.Text(muted ? L"Muted" : L"Volume", d.fSmall, lr, d.muted, 0.8f);
+                wchar_t pc[8]; swprintf_s(pc, L"%d%%", (int)(shown * 100.0f + 0.5f));
+                d.Text(pc, d.fSmall, lr, d.text, 0.9f, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                D2D1_RECT_F tr = D2D1::RectF(gr.right + 6.0f * sc, y + 17.0f * sc, b.right - 20.0f * sc, y + 21.0f * sc);
+                float trad = H(tr) * 0.5f;
+                d.dc->FillRoundedRectangle(D2D1::RoundedRect(tr, trad, trad), d.track);
+                D2D1_RECT_F fill = tr; fill.right = tr.left + W(tr) * shown;
+                d.dc->FillRoundedRectangle(D2D1::RoundedRect(fill, trad, trad), d.accent);
+                y += 30.0f * sc;
+            }
+            // Compact now-playing row: art thumb + title/artist. Full transport controls are one
+            // click away in the Open panel's MediaCard; this view is paint-only (no buttons).
+            MediaState m = MediaSnapshot();
+            if (m.active) {
+                D2D1_RECT_F art = D2D1::RectF(b.left + 20 * sc, y, b.left + 20 * sc + 28 * sc, y + 28 * sc);
+                DrawCircularArt(d, art, d.fGlyph);
+                float tx = art.right + 10.0f * sc;
+                std::wstring artistLine = m.sourceName.empty() ? m.artist : m.artist + L"  \x00B7  " + m.sourceName;
+                d.Text(m.title.empty() ? L"Nothing playing" : m.title, d.fSmall,
+                       D2D1::RectF(tx, y, b.right - 20.0f * sc, y + 16.0f * sc), d.text, 0.92f);
+                d.Text(artistLine, d.fSmall, D2D1::RectF(tx, y + 15.0f * sc, b.right - 20.0f * sc, y + 29.0f * sc), d.muted, 0.75f);
+                y += 34.0f * sc;
             }
             d.dc->FillRectangle(D2D1::RectF(b.left + 24 * sc, y + 5 * sc, b.right - 24 * sc, y + 6 * sc), d.divider);
             y += 16 * sc;
@@ -3609,13 +4086,7 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
     vol->glyph = L"\xE767";  // Fluent: volume
     vol->glyphFmt = nullptr;  // set below via dc
     vol->get = []() { return g_volScalar.load(); };
-    vol->set = [](float v) {
-        g_volScalar = v;
-        g_volMuted = false;
-        g_volSuppressPollUntil = NowSeconds() + 0.4;
-        g_volume.Set(v);
-        g_layoutDirty = true;
-    };
+    vol->set = [](float v) { SetSystemVolume(v); };
     panel->Add(std::move(vol));
 
     // Brightness slider (only if the island's monitor honors DDC/CI).
@@ -3707,7 +4178,8 @@ Surface* g_surface = nullptr;
 // bug. These procs must therefore stay trivial and return fast.
 LRESULT CALLBACK LlMouseProc(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && g_dismissActive.load() &&
-        (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN)) {
+        (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN) &&
+        NowSeconds() - g_dismissArmedAt.load() >= kDismissGraceSeconds) {
         auto* p = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
         RECT r;
         if (g_hwnd && GetWindowRect(g_hwnd, &r) && !PtInRect(&r, p->pt))
@@ -3716,7 +4188,7 @@ LRESULT CALLBACK LlMouseProc(int code, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 // Just arm/disarm the (always-installed) mouse hook; no SetWindowsHookEx on the render thread.
-void InstallDismissHook() { g_dismissActive = true; }
+void InstallDismissHook() { g_dismissArmedAt = NowSeconds(); g_dismissActive = true; }
 void RemoveDismissHook() { g_dismissActive = false; }
 
 // Volume-key capture: swallow VK_VOLUME_* so the composition-rendered Win11 OSD never shows.
@@ -3780,20 +4252,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             float cur = 0.0f; bool mut = false;
             g_volume.Get(cur, mut);
             if (wParam == VK_VOLUME_MUTE) {
-                bool nm = !mut;
-                g_volume.SetMute(nm);
-                g_volMuted = nm;
-                ShowVolumeTransient((int)(cur * 100.0f + 0.5f), nm);
+                ToggleSystemMute();
+                ShowVolumeTransient((int)(cur * 100.0f + 0.5f), !mut);
             } else {
                 const float step = 0.02f;  // matches the native 2%-per-press step
                 float nv = Clamp(cur + (wParam == VK_VOLUME_UP ? step : -step), 0.0f, 1.0f);
-                g_volume.Set(nv);
-                if (mut) g_volume.SetMute(false);  // Windows unmutes on volume up/down
-                g_volScalar = nv; g_volMuted = false;
+                SetSystemVolume(nv);
                 ShowVolumeTransient((int)(nv * 100.0f + 0.5f), false);
             }
-            g_volSuppressPollUntil = NowSeconds() + 0.4;  // avoid a duplicate popup from PollVolume
-            g_layoutDirty = true;
             return 0;
         }
         case WM_MOUSEMOVE:
@@ -3814,6 +4280,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_LBUTTONUP:
             g_lastInputSec = NowSeconds();
             if (g_surface) g_surface->OnUp({PointerPhase::Up, ClientPos(lParam)});
+            g_layoutDirty = true;
+            return 0;
+        case WM_MBUTTONDOWN:  // temporarily hide the whole island when it's in the way
+            g_lastInputSec = NowSeconds();
+            g_hideUntil = NowSeconds() + kHideSeconds;
+            if (g_surface) g_surface->Dismiss();  // also disarms the outside-click dismiss hook
             g_layoutDirty = true;
             return 0;
         case WM_MOUSEWHEEL:
@@ -3895,6 +4367,52 @@ DWORD WINAPI RenderThreadProc(void*) {
         const UINT dpi = s.autoDpiScale ? GetDpiForWindow(hwnd) : 96;
         const float scale = (dpi / 96.0f) * s.sizeScale;
 
+        // Temporary hide (middle-click, WM_MBUTTONDOWN): fades the whole island out rather than an
+        // abrupt show/hide, and auto-reshows the moment the cursor leaves the island's "territory"
+        // (a generous rect covering anywhere it could grow to) OR after kHideSeconds, whichever
+        // comes first -- the click just starts the clock; leaving the area is the real "I'm done
+        // with what was underneath" signal. Click-through is forced the INSTANT the gesture starts
+        // (not gated on the fade finishing) so the user can interact with what's underneath right
+        // away; the fade is purely visual.
+        static bool wasHidden = false;
+        POINT curForHide; GetCursorPos(&curForHide);
+        const bool hideTimerActive = now < g_hideUntil;
+        if (hideTimerActive && !wasHidden) {
+            // Just entered -- capture the territory rect once, centered on the CURRENT (pre-hide)
+            // window position, sized to the tallest/widest the island could ever grow to so
+            // interacting with whatever was underneath never prematurely reshows it.
+            RECT wr; GetWindowRect(hwnd, &wr);
+            DrawContext seedDc = renderer.MakeContext(scale, now);
+            const float maxW = (360.0f + 40.0f) * scale;
+            const float maxH = surface.MaxPossibleHeight(seedDc) + 60.0f * scale;
+            const LONG midX = (wr.left + wr.right) / 2;
+            g_hideWatchRect.left = midX - static_cast<LONG>(maxW * 0.5f);
+            g_hideWatchRect.right = midX + static_cast<LONG>(maxW * 0.5f);
+            if (s.position == Position::BottomCenter) {
+                g_hideWatchRect.bottom = wr.bottom + static_cast<LONG>(20.0f * scale);
+                g_hideWatchRect.top = g_hideWatchRect.bottom - static_cast<LONG>(maxH);
+            } else {
+                g_hideWatchRect.top = wr.top - static_cast<LONG>(20.0f * scale);
+                g_hideWatchRect.bottom = g_hideWatchRect.top + static_cast<LONG>(maxH);
+            }
+            std::lock_guard l(g_transMutex); g_trans = {};  // don't let a stale popup replay mid-fade-in
+        }
+        const bool wantHidden = hideTimerActive && (PtInRect(&g_hideWatchRect, curForHide) != FALSE);
+        if (wasHidden && !wantHidden) g_hideUntil = 0.0;  // consumed (timer ran out or cursor left) -- don't re-trigger
+        wasHidden = wantHidden;
+
+        static float hideT = 0.0f;        // 0 = fully visible, 1 = fully hidden
+        static double hideTickAt = -1.0;
+        {
+            const float target = wantHidden ? 1.0f : 0.0f;
+            const float dt = hideTickAt < 0.0 ? (1.0f / 60.0f)
+                                              : static_cast<float>(std::min(now - hideTickAt, 0.1));
+            hideTickAt = now;
+            hideT += (target - hideT) * (1.0f - std::exp(-dt / 0.12f));  // ~300-400ms fade
+            if (std::fabs(hideT - target) < 0.004f) hideT = target;
+        }
+        const bool hideAnimating = wantHidden ? (hideT < 0.996f) : (hideT > 0.004f);
+
         if (now >= nextVolPoll) { PollVolume(); nextVolPoll = now + 0.15; }
 
         // Caps / Num lock toggles -> transient pill.
@@ -3920,7 +4438,10 @@ DWORD WINAPI RenderThreadProc(void*) {
         // actual drawn panel from the last frame (screen coords).
         POINT cur; GetCursorPos(&cur);
         bool cursorInside = PtInRect(&g_pillRect, cur) != FALSE;
-        surface.UpdateAmbientState(cursorInside, now);
+        bool overVolumeHotspot = PtInRect(&g_volumeHotspotRect, cur) != FALSE;
+        // Freeze ambient state while hidden -- otherwise hovering the (invisible) territory would
+        // silently expand/collapse it, and it would pop into the wrong state once it fades back in.
+        if (!wantHidden) surface.UpdateAmbientState(cursorInside, now, overVolumeHotspot);
 
         // Flush any pending slider drag with correct scale.
         surface.FlushPendingDrag(dc);
@@ -3975,6 +4496,16 @@ DWORD WINAPI RenderThreadProc(void*) {
         g_volDisplayScalar = volDisplay;
         bool volAnimating = (volDisplay != volTarget);
 
+        // Per-state transparency: ease toward the denser "focus" tint while hovered/open, back
+        // to "rest" otherwise, so the pill stays unobtrusive at rest but reads clearly once the
+        // user is actually looking at/interacting with it.
+        static float stateMix = 0.0f;
+        float stateMixTarget =
+            (surface.state == SurfaceState::Expanded || surface.state == SurfaceState::Open) ? 1.0f : 0.0f;
+        stateMix += (stateMixTarget - stateMix) * (1.0f - std::exp(-dt / 0.15f));
+        if (std::fabs(stateMix - stateMixTarget) < 0.004f) stateMix = stateMixTarget;
+        bool stateMixAnimating = (stateMix != stateMixTarget);
+
         bool widgetAnimating = surface.Tick(dt);
         bool sizeAnimating = !wSpring.AtRest() || !hSpring.AtRest();
 
@@ -3982,10 +4513,24 @@ DWORD WINAPI RenderThreadProc(void*) {
         int ch = std::max(1, (int)std::ceil(hSpring.value));
 
         MediaState mediaNow = MediaSnapshot();
-        bool mediaLive = surface.state == SurfaceState::Open && mediaNow.active && mediaNow.playing;
+        // The now-playing indicator (art + waveform) shows in every state now (Collapsed/Expanded/
+        // Open), not just the Open panel's MediaCard -- so the waveform must animate there too.
+        bool mediaLive = mediaNow.active && mediaNow.playing;
         g_waveWanted = mediaLive;  // let the audio-meter thread idle when the waveform is hidden
         bool privacyLive = g_micActive.load() || g_camActive.load();
         bool inputActive = (now - g_lastInputSec.load()) < 0.5;  // hover/drag responsiveness window
+
+        // Resolve this frame's backdrop recipe (per-state opacity, then accent/theme colors) and
+        // step the theme engine BEFORE the needsRender decision below -- both must run every tick
+        // (not just on an actual render) so an Auto-mode Windows theme flip is noticed promptly
+        // and ThemeEngine::Animating() reflects THIS tick, not a stale one from the last render.
+        // Called unconditionally (even with the backdrop disabled) so the plain solid "None" panel
+        // still follows the Theme setting.
+        BackdropPreset resolvedBackdrop = s.backdrop;
+        ApplyStateOpacity(resolvedBackdrop, stateMix);
+        ResolveAccentColors(resolvedBackdrop);
+        float themeT = g_themeEngine.Step(s, resolvedBackdrop, now);
+        ResolveThemeColors(resolvedBackdrop, themeT);
 
         // A frame costs a full UpdateLayeredWindow re-composite of the (possibly large) panel
         // through DWM. Do it only when something actually changed — resting the cursor over the
@@ -3996,32 +4541,34 @@ DWORD WINAPI RenderThreadProc(void*) {
         const int clockKey = ClockMinuteKey();
         // Adaptive-theme stimulus: repaint when the sampled backdrop luminance has moved
         // meaningfully since the last render that consumed it (an idle island must still notice
-        // the background changing beneath it), and keep 60fps pacing while the text-color fade
-        // is mid-flight. lastBehindLum only advances when consumed so small drifts accumulate.
+        // the background changing beneath it). Only relevant in Adaptive mode -- in the other
+        // modes the sampler is idle and g_behindLum sits at -1, which must not itself count as
+        // "moved" every tick. lastBehindLum only advances when consumed so small drifts accumulate.
         static float lastBehindLum = -2.0f;
         const float behindLum = g_behindLum.load();
-        bool themeStim = std::fabs(behindLum - lastBehindLum) > 0.02f;
+        bool themeStim = s.themeMode == ThemeMode::Adaptive &&
+                         std::fabs(behindLum - lastBehindLum) > 0.02f;
         if (themeStim) lastBehindLum = behindLum;
         bool active = widgetAnimating || sizeAnimating || surface.IsCapturing() ||
                       mediaLive || privacyLive || inputActive || volAnimating ||
-                      renderer.ThemeAnimating();
+                      stateMixAnimating || g_themeEngine.Animating() || hideAnimating;
         bool needsRender = firstFrame || active || themeStim || g_layoutDirty.load() ||
                            clockKey != lastClockKey || cursorInside != lastCursorInside;
         lastCursorInside = cursorInside;
         lastClockKey = clockKey;
 
         if (needsRender) {
-            // Real blur-behind: resolve any accent-color channels against the live Windows accent
-            // (a per-frame LOCAL copy — never mutate the shared Settings recipe), then bring the
-            // companion window's state in line BEFORE the frame is drawn — BeginFrame picks the
-            // panel tint variant from the result.
-            BackdropPreset resolvedBackdrop = s.backdrop;
-            if (s.backdropEnabled) ResolveAccentColors(resolvedBackdrop);
+            // Real blur-behind: bring the companion window's state in line BEFORE the frame is
+            // drawn (it only consumes blur/saturation from resolvedBackdrop, resolved above) --
+            // BeginFrame picks the panel tint variant from the result. Stays enabled through a
+            // temp-hide (its opacity is faded below, in lockstep with the main window) rather than
+            // being cut outright, which previously made the blur disappear instantly while the
+            // panel/text kept fading -- a visible seam between "background" and "foreground".
             g_backdropBlurLive = blurHost.Prepare(s.backdropEnabled, resolvedBackdrop, hwnd);
             D2D1_RECT_F inner;
             int tgtW = (int)std::ceil(wSpring.target), tgtH = (int)std::ceil(hSpring.target);
             bool settled = wSpring.AtRest() && hSpring.AtRest();
-            if (renderer.BeginFrame(s, resolvedBackdrop, cw, ch, tgtW, tgtH, settled, scale, inner)) {
+            if (renderer.BeginFrame(s, resolvedBackdrop, cw, ch, tgtW, tgtH, settled, scale, themeT, inner)) {
                 DrawContext pdc = renderer.MakeContext(scale, now);  // brushes valid post-BindDC
                 pdc.artBmp = renderer.ArtBitmap(mediaNow.art.gen, mediaNow.art.w, mediaNow.art.h, mediaNow.art.bgra);
                 BindGlyphFormats(surface, renderer.GlyphFormat());
@@ -4032,16 +4579,28 @@ DWORD WINAPI RenderThreadProc(void*) {
                 float panelLeft = std::floor((inner.left + inner.right - aw) * 0.5f + 0.5f);
                 D2D1_RECT_F panelR = D2D1::RectF(panelLeft, inner.top, panelLeft + aw, inner.top + ah);
                 // Publish the visible panel's screen rect for next frame's hover test (and, under
-                // the lock, for the luminance sampler thread).
+                // the lock, for the luminance sampler thread) -- and, same pattern, the mini
+                // volume element's screen-space hotspot (empty when not Collapsed).
                 { RECT wr; GetWindowRect(hwnd, &wr);
                   RECT pr = { wr.left + (LONG)panelR.left, wr.top + (LONG)panelR.top,
                               wr.left + (LONG)panelR.right, wr.top + (LONG)panelR.bottom };
                   AcquireSRWLockExclusive(&g_pillRectLock);
                   g_pillRect = pr;
-                  ReleaseSRWLockExclusive(&g_pillRectLock); }
+                  ReleaseSRWLockExclusive(&g_pillRectLock);
+                  D2D1_RECT_F hs = surface.VolumeHotspot();
+                  if (W(hs) > 0.0f && H(hs) > 0.0f) {
+                      g_volumeHotspotRect = { wr.left + (LONG)hs.left, wr.top + (LONG)hs.top,
+                                              wr.left + (LONG)hs.right, wr.top + (LONG)hs.bottom };
+                  } else {
+                      g_volumeHotspotRect = RECT{};
+                  } }
                 float panelRadius = std::min(H(panelR) * 0.5f, 22.0f * scale);
-                // Keep the real-blur companion clipped to this exact panel rect (it animates too).
-                if (g_backdropBlurLive) blurHost.SyncGeometry(hwnd, panelR, panelRadius);
+                // Keep the real-blur companion clipped to this exact panel rect (it animates too),
+                // and fade its opacity in lockstep with the main window's temp-hide alpha.
+                if (g_backdropBlurLive) {
+                    blurHost.SyncGeometry(hwnd, panelR, panelRadius);
+                    blurHost.SetOpacity(1.0f - hideT);
+                }
                 {
                     D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(panelR, panelRadius, panelRadius);
                     pdc.dc->FillRoundedRectangle(rr, pdc.panel);
@@ -4086,13 +4645,15 @@ DWORD WINAPI RenderThreadProc(void*) {
                         }
                     }
                 }
-                renderer.EndFrame(s);
+                renderer.EndFrame(s, 1.0f - hideT);
                 firstFrame = false;
             }
         }
 
-        // Click-through policy.
-        bool wantInteractive = (surface.state == SurfaceState::Open) || cursorInside || surface.IsCapturing();
+        // Click-through policy. Forced non-interactive the instant a temp-hide gesture starts
+        // (not gated on the fade finishing) so whatever's underneath is clickable right away.
+        bool wantInteractive = !wantHidden &&
+                               ((surface.state == SurfaceState::Open) || cursorInside || surface.IsCapturing());
         SetClickThrough(hwnd, !wantInteractive);
 
         // Frame pacing. While active, hold true 60fps with a 1ms timer resolution and an ABSOLUTE
@@ -4167,6 +4728,7 @@ void StopThreads() {
     if (g_inputHookTid) PostThreadMessageW(g_inputHookTid, WM_QUIT, 0, 0);  // unblock GetMessage
     HANDLE handles[] = {g_renderThread, g_notifThread, g_brightThread, g_calThread, g_mediaThread, g_audioThread, g_privacyThread, g_weatherThread, g_lumThread, g_inputHookThread};
     for (HANDLE h : handles) if (h) WaitForSingleObject(h, 4000);
+    g_volume.Shutdown();  // unregister the device-change callback now that the render thread (its only caller) has stopped
     for (HANDLE* h : {&g_renderThread, &g_notifThread, &g_brightThread, &g_calThread, &g_mediaThread, &g_audioThread, &g_privacyThread, &g_weatherThread, &g_lumThread, &g_inputHookThread})
         if (*h) { CloseHandle(*h); *h = nullptr; }
     g_inputHookTid = 0;
