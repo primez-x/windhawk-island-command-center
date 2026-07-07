@@ -2208,7 +2208,9 @@ struct CollapsedPill : Widget {
         MediaState m = MediaSnapshot();
         float leftW = std::max(dc.MeasureWidth(dc.fPill, TimeString()),
                                dc.MeasureWidth(dc.fPillSub, DatePillString()));
-        float total = 16.0f * s + leftW + 12.0f * s + kGlyphW * s + 6.0f * s + kTrackW * s + 12.0f * s;
+        // No glyph here (see Paint) -- the vertical fill track alone is the divider AND the
+        // volume indicator, so it stays slim instead of budgeting space for an icon.
+        float total = 16.0f * s + leftW + 12.0f * s + kTrackW * s + 12.0f * s;
         if (WeatherFresh()) total += 12.0f * s + dc.MeasureWidth(dc.fPill, WeatherShort());
         total += 16.0f * s;
         // Now-playing indicator: album art prepended on the left, a live waveform appended on
@@ -2260,8 +2262,8 @@ struct CollapsedPill : Widget {
                                      dc.MeasureWidth(dc.fPillSub, DatePillString()));
         const bool wx = WeatherFresh();
         const float weatherW = wx ? dc.MeasureWidth(dc.fPill, WeatherShort()) : 0.0f;
-        const float glyphW = kGlyphW * s, trackW = kTrackW * s;
-        float contentW = leftW + 12.0f * s + glyphW + 6.0f * s + trackW + 12.0f * s;
+        const float trackW = kTrackW * s;
+        float contentW = leftW + 12.0f * s + trackW + 12.0f * s;
         if (wx) contentW += 12.0f * s + weatherW;
         const bool showArt = m.active;
         const bool showWave = m.active && m.playing;
@@ -2281,13 +2283,10 @@ struct CollapsedPill : Widget {
         dc.Text(DatePillString(), dc.fPillSub, D2D1::RectF(lx, b.top + 27.0f * s, lx + leftW, b.top + 41.0f * s),
                 dc.muted, 0.85f, DWRITE_TEXT_ALIGNMENT_CENTER);
 
-        const float glyphX = lx + leftW + 12.0f * s;
+        // No glyph -- the vertical fill track alone is the divider AND the volume indicator
+        // (dimmed to the muted color while muted, rather than budgeting space for a mute icon).
         const bool muted = g_volMuted.load();
-        dc.Text(muted ? L"\xE74F" : L"\xE767", dc.fGlyph,
-                D2D1::RectF(glyphX, b.top, glyphX + glyphW, b.bottom), dc.text, 0.85f,
-                DWRITE_TEXT_ALIGNMENT_CENTER);
-
-        const float trackX = glyphX + glyphW + 6.0f * s;
+        const float trackX = lx + leftW + 12.0f * s;
         D2D1_RECT_F tr = D2D1::RectF(trackX, b.top + 13.0f * s, trackX + trackW, b.bottom - 13.0f * s);
         trackRect_ = tr;
         const float rad = trackW * 0.5f;
@@ -2296,10 +2295,10 @@ struct CollapsedPill : Widget {
         const float fillTop = tr.bottom - H(tr) * vol;
         if (fillTop < tr.bottom - 0.5f)
             dc.dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(tr.left, fillTop, tr.right, tr.bottom), rad, rad),
-                                        dc.accent);
-        // Hotspot spans the full pill height (generous vertical target) but stays narrow
-        // horizontally so it doesn't swallow clicks meant for the clock, weather, or art/waveform.
-        hotspot_ = D2D1::RectF(glyphX - 4.0f * s, b.top, trackX + trackW + 4.0f * s, b.bottom);
+                                        muted ? dc.muted : dc.accent);
+        // Hotspot spans the full pill height (generous vertical target) and is inflated well
+        // beyond the now-slim track horizontally so it's still an easy drag/click target.
+        hotspot_ = D2D1::RectF(trackX - 12.0f * s, b.top, trackX + trackW + 12.0f * s, b.bottom);
 
         float afterX = trackX + trackW;
         if (wx) {
@@ -2328,7 +2327,7 @@ struct CollapsedPill : Widget {
     }
 
    private:
-    static constexpr float kGlyphW = 16.0f, kTrackW = 4.0f, kArtSize = 34.0f, kArtGap = 10.0f, kWaveW = 40.0f;
+    static constexpr float kTrackW = 4.0f, kArtSize = 34.0f, kArtGap = 10.0f, kWaveW = 40.0f;
     D2D1_RECT_F hotspot_{};
     D2D1_RECT_F trackRect_{};
     bool dragging_ = false, moved_ = false;
