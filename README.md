@@ -8,10 +8,10 @@ a **real, variable-strength blur-behind** material (not a tint-only fake).
 It draws a layered pill at the top of your monitor that morphs between three states:
 
 - **Collapsed pill** — large centered clock + live weather (☀ 67°), a mini
-  **volume element** (speaker glyph + vertical fill track: drag to set, click
-  to mute, scroll-wheel to step ±2%) in place of the old plain divider, and —
-  whenever something's playing — circular album art on the left edge and a
-  live waveform on the right, plus transient pills for brightness changes,
+  **volume element** (a slim vertical fill track that doubles as the divider:
+  drag to set, click to mute — the fill dims while muted — scroll-wheel to
+  step ±2%), and — whenever something's playing — circular album art on the
+  left edge and a live waveform on the right, plus transient pills for brightness changes,
   clipboard, USB/Bluetooth devices, and caps/num lock, and pulsing **mic/camera
   privacy dots** when in use. **Middle-click anywhere on the island to hide it**
   when it's in the way — it fades out smoothly (panel, blur, and content all
@@ -22,8 +22,9 @@ It draws a layered pill at the top of your monitor that morphs between three sta
   and a mini "Up next" agenda. Scroll-wheel here adjusts volume too.
 - **Control center** (click) — a pinned panel with:
   - **Now playing** — circular album art, friendly source name (Spotify/Edge/
-    etc.), transport, draggable scrub bar with elapsed/remaining time, live
-    audio waveform.
+    etc.), centered transport buttons with hover highlights, draggable scrub
+    bar with elapsed/remaining time, and a live audio waveform beside the
+    title (five rounded bars mirrored around center, smoothly eased).
   - **Volume** and **Brightness** sliders (instant; brightness via DDC/CI on the
     island's monitor, auto-hidden if the monitor doesn't support it).
   - **Functional calendar** — month navigation, today, day selection, and a

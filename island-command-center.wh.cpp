@@ -1981,6 +1981,12 @@ struct DrawContext {
     IDWriteFactory* dw = nullptr;
     float scale = 1.0f;
     double now = 0.0;
+    // Cursor in client (widget) coordinates, set once per frame by the render loop -- lets
+    // widgets paint hover states without a per-widget mouse-move routing mechanism.
+    D2D1_POINT_2F cursor = D2D1::Point2F(-10000.0f, -10000.0f);
+    bool CursorIn(const D2D1_RECT_F& r) const {
+        return cursor.x >= r.left && cursor.x <= r.right && cursor.y >= r.top && cursor.y <= r.bottom;
+    }
 
     // Brushes (owned by Renderer).
     ID2D1SolidColorBrush* text = nullptr;
@@ -2196,6 +2202,36 @@ void DrawCircularArt(DrawContext& dc, D2D1_RECT_F rect, IDWriteTextFormat* place
     if (placeholderGlyphFmt) dc.Text(L"\xE8D6", placeholderGlyphFmt, rect, dc.muted, 0.6f, DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
+// Live-audio waveform strip: kWaveBars slim bars mirrored around the strip's vertical center
+// (Dynamic Island "horizontal centered" style) with fully rounded caps. Each bar eases toward
+// the newest meter samples per frame instead of snapping, so the strip breathes rather than
+// flickers. `smooth` is the caller's per-bar easing state -- one array per on-screen strip, so
+// multiple strips (collapsed pill + MediaCard) animate independently. Shared by every waveform
+// in the mod so there's exactly one place that decides how audio activity looks.
+constexpr int kWaveBars = 5;
+void DrawWaveform(DrawContext& dc, D2D1_RECT_F wf, float (&smooth)[kWaveBars], bool playing) {
+    int wcount; auto wave = WaveSnapshot(wcount);
+    const float slotW = W(wf) / kWaveBars;
+    const float barW = slotW * 0.5f;
+    const float rad = barW * 0.5f;
+    const float cy = (wf.top + wf.bottom) * 0.5f;
+    for (int i = 0; i < kWaveBars; ++i) {
+        int idx = wcount - kWaveBars + i;
+        float target = idx >= 0 ? wave[((idx % kWaveN) + kWaveN) % kWaveN] : 0.0f;
+        if (!playing) target *= 0.2f;
+        smooth[i] += (target - smooth[i]) * 0.22f;  // per-frame ease at ~60fps
+        const float v = Clamp(smooth[i], 0.0f, 1.0f);
+        // Minimum half-height = the cap radius, so an idle bar is a perfect little pill dot
+        // rather than a degenerate rounded rect.
+        const float half = std::max(rad, v * H(wf) * 0.5f);
+        const float x = wf.left + i * slotW + (slotW - barW) * 0.5f;
+        dc.accent->SetOpacity(0.4f + 0.6f * v);
+        dc.dc->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(x, cy - half, x + barW, cy + half), rad, rad), dc.accent);
+    }
+    dc.accent->SetOpacity(1.0f);
+}
+
 // --- CollapsedPill: clock/date + weather + a mini volume element --------------
 // Replaces the old plain divider between the clock and weather with a tiny speaker glyph +
 // vertical fill track showing/controlling system volume. It is the pill's ONLY clickable/
@@ -2311,23 +2347,14 @@ struct CollapsedPill : Widget {
 
         if (showWave) {
             const float waveX = afterX + kArtGap * s;
-            D2D1_RECT_F wf = D2D1::RectF(waveX, b.top + 17.0f * s, waveX + kWaveW * s, b.bottom - 17.0f * s);
-            int wcount; auto wave = WaveSnapshot(wcount);
-            const int bars = 8; const float bw = W(wf) / bars;
-            for (int i = 0; i < bars; ++i) {
-                int idx = wcount - bars + i;
-                float v = idx >= 0 ? wave[((idx % kWaveN) + kWaveN) % kWaveN] : 0.0f;
-                float hgt = std::max(1.0f, v * H(wf));
-                float x = wf.left + i * bw;
-                dc.accent->SetOpacity(0.4f + 0.6f * v);
-                dc.dc->FillRectangle(D2D1::RectF(x, wf.bottom - hgt, x + bw * 0.6f, wf.bottom), dc.accent);
-            }
-            dc.accent->SetOpacity(1.0f);
+            D2D1_RECT_F wf = D2D1::RectF(waveX, b.top + 14.0f * s, waveX + kWaveW * s, b.bottom - 14.0f * s);
+            DrawWaveform(dc, wf, waveSmooth_, true);
         }
     }
 
    private:
     static constexpr float kTrackW = 4.0f, kArtSize = 34.0f, kArtGap = 10.0f, kWaveW = 40.0f;
+    float waveSmooth_[kWaveBars] = {};
     D2D1_RECT_F hotspot_{};
     D2D1_RECT_F trackRect_{};
     bool dragging_ = false, moved_ = false;
@@ -2354,7 +2381,7 @@ struct Button : Widget {
     void Paint(DrawContext& dc) override {
         const float s = dc.scale;
         D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(bounds, 8.0f * s, 8.0f * s);
-        dc.card->SetOpacity(pressed ? 0.18f : 0.10f);
+        dc.card->SetOpacity(pressed ? 0.18f : dc.CursorIn(bounds) ? 0.14f : 0.10f);
         dc.dc->FillRoundedRectangle(rr, dc.card);
         dc.card->SetOpacity(1.0f);
         std::wstring t = glyph.empty() ? text : (glyph + L"  " + text);
@@ -2593,7 +2620,7 @@ struct MediaCard : Widget {
         return D2D1::RectF(bounds.left + 12 * s, bounds.bottom - 15 * s, bounds.right - 12 * s, bounds.bottom - 11 * s);
     }
     void Buttons(float s, D2D1_RECT_F& prev, D2D1_RECT_F& play, D2D1_RECT_F& next) const {
-        float cx = (bounds.left + 84 * s + bounds.right) * 0.5f;
+        float cx = (bounds.left + bounds.right) * 0.5f;  // centered across the whole card
         float y0 = bounds.top + 60 * s, y1 = bounds.top + 88 * s, r = 15 * s;
         prev = D2D1::RectF(cx - 44 * s - r, y0, cx - 44 * s + r, y1);
         play = D2D1::RectF(cx - r, y0, cx + r, y1);
@@ -2627,32 +2654,34 @@ struct MediaCard : Widget {
         D2D1_RECT_F art = D2D1::RectF(bounds.left + 10 * s, bounds.top + 10 * s, bounds.left + 74 * s, bounds.top + 74 * s);
         DrawCircularArt(dc, art, dc.fGlyph ? dc.fGlyph : dc.fTitle);
 
+        // Text column stops short of the right edge to leave room for the waveform beside it.
         float tx = bounds.left + 84 * s;
+        float textRight = bounds.right - 64 * s;
         dc.Text(m.title.empty() ? L"Nothing playing" : m.title, dc.fTitle,
-                D2D1::RectF(tx, bounds.top + 12 * s, bounds.right - 12 * s, bounds.top + 34 * s), dc.text, 0.95f);
+                D2D1::RectF(tx, bounds.top + 12 * s, textRight, bounds.top + 34 * s), dc.text, 0.95f);
         std::wstring artistLine = m.sourceName.empty() ? m.artist : m.artist + L"  \x00B7  " + m.sourceName;
-        dc.Text(artistLine, dc.fSmall, D2D1::RectF(tx, bounds.top + 34 * s, bounds.right - 12 * s, bounds.top + 52 * s), dc.muted, 0.8f);
+        dc.Text(artistLine, dc.fSmall, D2D1::RectF(tx, bounds.top + 34 * s, textRight, bounds.top + 52 * s), dc.muted, 0.8f);
 
-        // Live waveform strip.
-        int wcount; auto wave = WaveSnapshot(wcount);
-        D2D1_RECT_F wf = D2D1::RectF(tx, bounds.top + 52 * s, bounds.right - 12 * s, bounds.top + 60 * s);
-        const int bars = 20; float bw = W(wf) / bars;
-        for (int i = 0; i < bars; ++i) {
-            int idx = wcount - bars + i;
-            float v = idx >= 0 ? wave[((idx % kWaveN) + kWaveN) % kWaveN] : 0.0f;
-            if (!m.playing) v *= 0.2f;
-            float h = std::max(1.0f, v * 8 * s);
-            float x = wf.left + i * bw;
-            dc.accent->SetOpacity(0.4f + 0.6f * v);
-            dc.dc->FillRectangle(D2D1::RectF(x, wf.bottom - h, x + bw * 0.6f, wf.bottom), dc.accent);
-        }
-        dc.accent->SetOpacity(1.0f);
+        // Live waveform: right of the title/artist rows, above the button row.
+        D2D1_RECT_F wf = D2D1::RectF(bounds.right - 56 * s, bounds.top + 16 * s, bounds.right - 14 * s, bounds.top + 50 * s);
+        DrawWaveform(dc, wf, waveSmooth_, m.playing);
 
         D2D1_RECT_F bp, bpl, bn; Buttons(s, bp, bpl, bn);
         IDWriteTextFormat* g = dc.fGlyph ? dc.fGlyph : dc.fTitle;
-        dc.Text(L"\xE892", g, bp, dc.text, 0.9f, DWRITE_TEXT_ALIGNMENT_CENTER);
-        dc.Text(m.playing ? L"\xE769" : L"\xE768", g, bpl, dc.text, 0.95f, DWRITE_TEXT_ALIGNMENT_CENTER);
-        dc.Text(L"\xE893", g, bn, dc.text, 0.9f, DWRITE_TEXT_ALIGNMENT_CENTER);
+        auto drawBtn = [&](const D2D1_RECT_F& r, const std::wstring& glyphStr, float baseOp) {
+            const bool hov = dc.CursorIn(r);
+            if (hov) {
+                const float hr = std::min(W(r), H(r)) * 0.5f + 5 * s;
+                dc.card->SetOpacity(0.14f);
+                dc.dc->FillEllipse(D2D1::Ellipse(
+                    D2D1::Point2F((r.left + r.right) * 0.5f, (r.top + r.bottom) * 0.5f), hr, hr), dc.card);
+                dc.card->SetOpacity(1.0f);
+            }
+            dc.Text(glyphStr, g, r, dc.text, hov ? 1.0f : baseOp, DWRITE_TEXT_ALIGNMENT_CENTER);
+        };
+        drawBtn(bp, L"\xE892", 0.9f);
+        drawBtn(bpl, m.playing ? L"\xE769" : L"\xE768", 0.95f);
+        drawBtn(bn, L"\xE893", 0.9f);
 
         D2D1_RECT_F sk = SeekRect(s); float rad = H(sk) * 0.5f;
         dc.dc->FillRoundedRectangle(D2D1::RoundedRect(sk, rad, rad), dc.track);
@@ -2672,6 +2701,7 @@ struct MediaCard : Widget {
     float lastScale_ = 1.0f;
     bool seeking_ = false;
     float pendingFrac_ = -1.0f;
+    float waveSmooth_[kWaveBars] = {};
 };
 
 // --- StackPanel --------------------------------------------------------------
@@ -4436,6 +4466,10 @@ DWORD WINAPI RenderThreadProc(void*) {
         // the empty area where the expanded panel *would* be trigger the expand. g_pillRect is the
         // actual drawn panel from the last frame (screen coords).
         POINT cur; GetCursorPos(&cur);
+        {   // publish the cursor in client (widget) coords for hover-state painting
+            POINT cc = cur; ScreenToClient(hwnd, &cc);
+            dc.cursor = D2D1::Point2F((float)cc.x, (float)cc.y);
+        }
         bool cursorInside = PtInRect(&g_pillRect, cur) != FALSE;
         bool overVolumeHotspot = PtInRect(&g_volumeHotspotRect, cur) != FALSE;
         // Freeze ambient state while hidden -- otherwise hovering the (invisible) territory would
@@ -4569,6 +4603,7 @@ DWORD WINAPI RenderThreadProc(void*) {
             bool settled = wSpring.AtRest() && hSpring.AtRest();
             if (renderer.BeginFrame(s, resolvedBackdrop, cw, ch, tgtW, tgtH, settled, scale, themeT, inner)) {
                 DrawContext pdc = renderer.MakeContext(scale, now);  // brushes valid post-BindDC
+                pdc.cursor = dc.cursor;  // carry the frame's cursor for hover-state painting
                 pdc.artBmp = renderer.ArtBitmap(mediaNow.art.gen, mediaNow.art.w, mediaNow.art.h, mediaNow.art.bgra);
                 BindGlyphFormats(surface, renderer.GlyphFormat());
                 // The gliding panel: animating size, TOP-anchored and horizontally centered inside
