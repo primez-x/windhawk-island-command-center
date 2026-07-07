@@ -1100,6 +1100,8 @@ double g_volSuppressPollUntil = 0.0;  // render-thread only
 
 HWND g_hwnd = nullptr;
 RECT g_pillRect = {};  // screen rect of the VISIBLE panel (not the window) — drives hover detection
+SRWLOCK g_pillRectLock = SRWLOCK_INIT;  // guards cross-thread reads (luminance sampler); render thread is the only writer and reads it un-locked
+std::atomic<float> g_behindLum{-1.0f};  // mean luma [0..1] of the desktop around the panel; < 0 = no sample yet
 HANDLE g_stopEvent = nullptr;
 HANDLE g_renderThread = nullptr;
 HANDLE g_notifThread = nullptr;
@@ -1712,6 +1714,84 @@ DWORD WINAPI PrivacyThreadProc(void*) {
         bool cam = IsCapabilityInUse(L"webcam");
         if (mic != g_micActive.load() || cam != g_camActive.load()) { g_micActive = mic; g_camActive = cam; g_layoutDirty = true; }
         WaitForSingleObject(g_stopEvent, 1500);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Backdrop luminance sampler (adaptive text theme)
+// ---------------------------------------------------------------------------
+// Samples the composed screen in thin strips just OUTSIDE the visible panel
+// (left/right/below, clamped to its monitor) every ~300ms and publishes an
+// EMA-smoothed mean luma. Strips, not the panel's own rect: capturing the
+// panel would read back our own text/tint (a feedback loop that oscillates
+// the theme), while the neighborhood is exactly what the 5-30px backdrop blur
+// mixes into the panel anyway. The render thread composites this with the
+// active tint and flips the foreground palette (see Renderer::BeginFrame).
+HANDLE g_lumThread = nullptr;
+
+void SampleRegionLuma(HDC screen, const RECT& r, double& sum, long& n) {
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    if (w <= 0 || h <= 0) return;
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;  // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC mem = CreateCompatibleDC(screen);
+    if (!mem) return;
+    HBITMAP dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (dib && bits) {
+        HGDIOBJ old = SelectObject(mem, dib);
+        if (BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY)) {
+            GdiFlush();
+            const uint32_t* px = static_cast<const uint32_t*>(bits);
+            for (int y = 0; y < h; y += 3) {
+                for (int x = 0; x < w; x += 3) {
+                    const uint32_t p = px[y * w + x];
+                    sum += 0.299 * ((p >> 16) & 0xFF) + 0.587 * ((p >> 8) & 0xFF) + 0.114 * (p & 0xFF);
+                    ++n;
+                }
+            }
+        }
+        SelectObject(mem, old);
+    }
+    if (dib) DeleteObject(dib);
+    DeleteDC(mem);
+}
+
+DWORD WINAPI LuminanceThreadProc(void*) {
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    float ema = -1.0f;
+    while (WaitForSingleObject(g_stopEvent, 300) == WAIT_TIMEOUT) {
+        AcquireSRWLockShared(&g_pillRectLock);
+        const RECT pill = g_pillRect;
+        ReleaseSRWLockShared(&g_pillRectLock);
+        if (IsRectEmpty(&pill)) continue;
+        MONITORINFO mi = {sizeof(mi)};
+        if (!GetMonitorInfoW(MonitorFromRect(&pill, MONITOR_DEFAULTTONEAREST), &mi)) continue;
+        const LONG gap = 10, thick = 26;
+        const RECT strips[3] = {
+            {pill.left - gap - thick, pill.top, pill.left - gap, pill.bottom},      // left of panel
+            {pill.right + gap, pill.top, pill.right + gap + thick, pill.bottom},    // right of panel
+            {pill.left, pill.bottom + gap, pill.right, pill.bottom + gap + thick},  // below panel
+        };
+        HDC screen = GetDC(nullptr);
+        if (!screen) continue;
+        double sum = 0.0;
+        long n = 0;
+        for (const RECT& s : strips) {
+            RECT c;
+            if (IntersectRect(&c, &s, &mi.rcMonitor)) SampleRegionLuma(screen, c, sum, n);
+        }
+        ReleaseDC(nullptr, screen);
+        if (n < 300) continue;  // strips (almost) fully clipped -> keep the last published value
+        const float mean = static_cast<float>(sum / (255.0 * n));
+        ema = ema < 0.0f ? mean : ema + 0.35f * (mean - ema);
+        g_behindLum = ema;
     }
     return 0;
 }
@@ -2479,6 +2559,36 @@ class Renderer {
             else
                 bPanel_->SetColor(D2D1::ColorF(backdrop.fr, backdrop.fg, backdrop.fb, backdrop.fa));
         }
+        // --- Adaptive text theme --------------------------------------------------------------
+        // What the user reads against = the desktop behind the panel (sampled around it by
+        // LuminanceThreadProc; Gaussian blur preserves mean luminance) composited with the active
+        // tint. Hysteresis (dark text above 0.52, light text below 0.44) + a 1s minimum dwell +
+        // a short fade keep video playing behind the island from ever strobing the text.
+        {
+            const double tnow = NowSeconds();
+            const float behind = g_behindLum.load();
+            if (behind >= 0.0f && tnow - themeFlipAt_ > 1.0) {
+                const float a0 = g_backdropBlurLive ? backdrop.a : backdrop.fa;
+                const float tintR = g_backdropBlurLive ? backdrop.r : backdrop.fr;
+                const float tintG = g_backdropBlurLive ? backdrop.g : backdrop.fg;
+                const float tintB = g_backdropBlurLive ? backdrop.b : backdrop.fb;
+                // PillOpacity thins the solid panel (EndFrame applies it only when the backdrop
+                // is disabled), letting more desktop through — fold it into the tint alpha.
+                const float a =
+                    settings.backdropEnabled ? a0 : a0 * Clamp(settings.pillOpacity, 0.35f, 1.0f);
+                const float tintLum = 0.299f * tintR + 0.587f * tintG + 0.114f * tintB;
+                const float surface = behind * (1.0f - a) + tintLum * a;
+                if (!themeDark_ && surface > 0.52f) { themeDark_ = true; themeFlipAt_ = tnow; }
+                else if (themeDark_ && surface < 0.44f) { themeDark_ = false; themeFlipAt_ = tnow; }
+            }
+            const float target = themeDark_ ? 1.0f : 0.0f;
+            const float dt = themeTickAt_ < 0.0 ? (1.0f / 60.0f)
+                                                : static_cast<float>(std::min(tnow - themeTickAt_, 0.1));
+            themeTickAt_ = tnow;
+            themeT_ += (target - themeT_) * (1.0f - std::exp(-dt / 0.08f));  // ~250ms fade
+            if (std::fabs(themeT_ - target) < 0.004f) themeT_ = target;
+        }
+        ApplyThemeBrushes(themeT_);
         target_->BeginDraw();
         target_->Clear(D2D1::ColorF(0, 0.0f));
         innerOut = D2D1::RectF(padX, padY, (float)bitmapWidth_ - padX, (float)bitmapHeight_ - padY);
@@ -2507,6 +2617,10 @@ class Renderer {
         target_->FillRoundedRectangle(rr, bPanel_.Get());
         target_->DrawRoundedRectangle(rr, bBorder_.Get(), 1.0f);
     }
+
+    // True while the adaptive text theme is mid-fade — the render loop keeps 60fps pacing until
+    // the palette lands (themeT_ snaps exactly to its target when it arrives, so == is safe).
+    bool ThemeAnimating() const { return themeT_ != (themeDark_ ? 1.0f : 0.0f); }
 
    private:
     void PositionOverlayWindow(const Settings& s, int width, int height);
@@ -2564,18 +2678,43 @@ class Renderer {
         if (fGlyph_) { fGlyph_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER); fGlyph_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER); }
         lastScale_ = scale;
     }
+    // Foreground theme palettes: [0] = light-on-dark (the classic dark panel), [1] = dark-on-light
+    // (light content behind/under the panel). The adaptive theme lerps every foreground brush
+    // between them; accent and panel are excluded (accent is semantic, panel comes from the
+    // BackdropStyle recipe).
+    struct ThemeColor { float r, g, b, a; };
+    struct ThemePalette { ThemeColor text, muted, card, border, divider, track; };
+    static constexpr ThemePalette kThemes[2] = {
+        {{1, 1, 1, 0.96f}, {1, 1, 1, 0.62f}, {1, 1, 1, 1.0f},
+         {1, 1, 1, 0.10f}, {1, 1, 1, 0.12f}, {1, 1, 1, 0.16f}},
+        {{0.05f, 0.05f, 0.07f, 0.95f}, {0.07f, 0.07f, 0.09f, 0.60f}, {0, 0, 0, 1.0f},
+         {0, 0, 0, 0.16f}, {0, 0, 0, 0.16f}, {0, 0, 0, 0.20f}},
+    };
     void EnsureBrushes() {
-        auto mk = [&](float r, float g, float b, float a, ComPtr<ID2D1SolidColorBrush>& out) {
-            if (!out) target_->CreateSolidColorBrush(D2D1::ColorF(r, g, b, a), &out);
+        auto mk = [&](const ThemeColor& c, ComPtr<ID2D1SolidColorBrush>& out) {
+            if (!out) target_->CreateSolidColorBrush(D2D1::ColorF(c.r, c.g, c.b, c.a), &out);
         };
-        mk(1, 1, 1, 0.96f, bText_);
-        mk(1, 1, 1, 0.62f, bMuted_);
-        mk(0.20f, 0.55f, 1.0f, 1.0f, bAccent_);
-        mk(0.043f, 0.043f, 0.051f, 0.94f, bPanel_);
-        mk(1, 1, 1, 1.0f, bCard_);     // opacity varied at draw time
-        mk(1, 1, 1, 0.10f, bBorder_);
-        mk(1, 1, 1, 0.12f, bDivider_);
-        mk(1, 1, 1, 0.16f, bTrack_);
+        mk(kThemes[0].text, bText_);
+        mk(kThemes[0].muted, bMuted_);
+        mk({0.20f, 0.55f, 1.0f, 1.0f}, bAccent_);
+        mk({0.043f, 0.043f, 0.051f, 0.94f}, bPanel_);
+        mk(kThemes[0].card, bCard_);     // opacity varied at draw time
+        mk(kThemes[0].border, bBorder_);
+        mk(kThemes[0].divider, bDivider_);
+        mk(kThemes[0].track, bTrack_);
+    }
+    // Slide the foreground palette to the current theme position (0 = light-on-dark).
+    void ApplyThemeBrushes(float t) {
+        auto set = [&](const ThemeColor& c0, const ThemeColor& c1, ComPtr<ID2D1SolidColorBrush>& br) {
+            if (br) br->SetColor(D2D1::ColorF(c0.r + (c1.r - c0.r) * t, c0.g + (c1.g - c0.g) * t,
+                                              c0.b + (c1.b - c0.b) * t, c0.a + (c1.a - c0.a) * t));
+        };
+        set(kThemes[0].text, kThemes[1].text, bText_);
+        set(kThemes[0].muted, kThemes[1].muted, bMuted_);
+        set(kThemes[0].card, kThemes[1].card, bCard_);
+        set(kThemes[0].border, kThemes[1].border, bBorder_);
+        set(kThemes[0].divider, kThemes[1].divider, bDivider_);
+        set(kThemes[0].track, kThemes[1].track, bTrack_);
     }
 
     HWND hwnd_ = nullptr;
@@ -2592,6 +2731,10 @@ class Renderer {
     int bitmapWidth_ = 0, bitmapHeight_ = 0;   // allocated DIB size (may exceed the presented size)
     int presentW_ = 0, presentH_ = 0;          // size actually shown via UpdateLayeredWindow
     float lastScale_ = 0.0f;
+    bool themeDark_ = false;      // current side of the theme hysteresis (true = dark-on-light)
+    float themeT_ = 0.0f;         // animated palette position: 0 light-on-dark .. 1 dark-on-light
+    double themeFlipAt_ = -10.0;  // last hysteresis flip (enforces the minimum dwell)
+    double themeTickAt_ = -1.0;   // last fade tick (frame-rate independent easing)
 };
 
 // ---------------------------------------------------------------------------
@@ -3851,9 +3994,18 @@ DWORD WINAPI RenderThreadProc(void*) {
         static int  lastClockKey = -1;
         static bool firstFrame = true;
         const int clockKey = ClockMinuteKey();
+        // Adaptive-theme stimulus: repaint when the sampled backdrop luminance has moved
+        // meaningfully since the last render that consumed it (an idle island must still notice
+        // the background changing beneath it), and keep 60fps pacing while the text-color fade
+        // is mid-flight. lastBehindLum only advances when consumed so small drifts accumulate.
+        static float lastBehindLum = -2.0f;
+        const float behindLum = g_behindLum.load();
+        bool themeStim = std::fabs(behindLum - lastBehindLum) > 0.02f;
+        if (themeStim) lastBehindLum = behindLum;
         bool active = widgetAnimating || sizeAnimating || surface.IsCapturing() ||
-                      mediaLive || privacyLive || inputActive || volAnimating;
-        bool needsRender = firstFrame || active || g_layoutDirty.load() ||
+                      mediaLive || privacyLive || inputActive || volAnimating ||
+                      renderer.ThemeAnimating();
+        bool needsRender = firstFrame || active || themeStim || g_layoutDirty.load() ||
                            clockKey != lastClockKey || cursorInside != lastCursorInside;
         lastCursorInside = cursorInside;
         lastClockKey = clockKey;
@@ -3879,10 +4031,14 @@ DWORD WINAPI RenderThreadProc(void*) {
                 float aw = std::min((float)cw, W(inner)), ah = std::min((float)ch, H(inner));
                 float panelLeft = std::floor((inner.left + inner.right - aw) * 0.5f + 0.5f);
                 D2D1_RECT_F panelR = D2D1::RectF(panelLeft, inner.top, panelLeft + aw, inner.top + ah);
-                // Publish the visible panel's screen rect for next frame's hover test.
+                // Publish the visible panel's screen rect for next frame's hover test (and, under
+                // the lock, for the luminance sampler thread).
                 { RECT wr; GetWindowRect(hwnd, &wr);
-                  g_pillRect = { wr.left + (LONG)panelR.left, wr.top + (LONG)panelR.top,
-                                 wr.left + (LONG)panelR.right, wr.top + (LONG)panelR.bottom }; }
+                  RECT pr = { wr.left + (LONG)panelR.left, wr.top + (LONG)panelR.top,
+                              wr.left + (LONG)panelR.right, wr.top + (LONG)panelR.bottom };
+                  AcquireSRWLockExclusive(&g_pillRectLock);
+                  g_pillRect = pr;
+                  ReleaseSRWLockExclusive(&g_pillRectLock); }
                 float panelRadius = std::min(H(panelR) * 0.5f, 22.0f * scale);
                 // Keep the real-blur companion clipped to this exact panel rect (it animates too).
                 if (g_backdropBlurLive) blurHost.SyncGeometry(hwnd, panelR, panelRadius);
@@ -3997,6 +4153,7 @@ bool StartThreads() {
     g_audioThread = CreateThread(nullptr, 0, AudioThreadProc, nullptr, 0, nullptr);
     g_privacyThread = CreateThread(nullptr, 0, PrivacyThreadProc, nullptr, 0, nullptr);
     g_weatherThread = CreateThread(nullptr, 0, WeatherThreadProc, nullptr, 0, nullptr);
+    g_lumThread = CreateThread(nullptr, 0, LuminanceThreadProc, nullptr, 0, nullptr);
     g_inputHookThread = CreateThread(nullptr, 0, InputHookThreadProc, nullptr, 0, nullptr);
 #if ICC_HAS_NOTIFICATION_LISTENER
     g_notifThread = CreateThread(nullptr, 0, NotificationThreadProc, nullptr, 0, nullptr);
@@ -4008,9 +4165,9 @@ void StopThreads() {
     if (g_brightEvent) SetEvent(g_brightEvent);
     if (g_calRefreshEvent) SetEvent(g_calRefreshEvent);
     if (g_inputHookTid) PostThreadMessageW(g_inputHookTid, WM_QUIT, 0, 0);  // unblock GetMessage
-    HANDLE handles[] = {g_renderThread, g_notifThread, g_brightThread, g_calThread, g_mediaThread, g_audioThread, g_privacyThread, g_weatherThread, g_inputHookThread};
+    HANDLE handles[] = {g_renderThread, g_notifThread, g_brightThread, g_calThread, g_mediaThread, g_audioThread, g_privacyThread, g_weatherThread, g_lumThread, g_inputHookThread};
     for (HANDLE h : handles) if (h) WaitForSingleObject(h, 4000);
-    for (HANDLE* h : {&g_renderThread, &g_notifThread, &g_brightThread, &g_calThread, &g_mediaThread, &g_audioThread, &g_privacyThread, &g_weatherThread, &g_inputHookThread})
+    for (HANDLE* h : {&g_renderThread, &g_notifThread, &g_brightThread, &g_calThread, &g_mediaThread, &g_audioThread, &g_privacyThread, &g_weatherThread, &g_lumThread, &g_inputHookThread})
         if (*h) { CloseHandle(*h); *h = nullptr; }
     g_inputHookTid = 0;
     if (g_brightEvent) { CloseHandle(g_brightEvent); g_brightEvent = nullptr; }

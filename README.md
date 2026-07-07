@@ -48,6 +48,16 @@ that channel. `FallbackColor`/`FallbackOpacity` control the denser solid tint
 used when composition blur isn't available (transparency effects off, or init
 failed) — the panel degrades gracefully rather than disappearing.
 
+## Adaptive text
+
+The foreground adapts to whatever is behind the island: a sampler thread
+watches the composed desktop in thin strips just *outside* the panel (never
+the panel itself, which would feed back its own text), composites that with
+the active tint, and slides the whole text/divider/track palette between
+white-on-dark and black-on-light as the surface turns predominantly dark or
+light. Hysteresis, a minimum dwell, and a ~250ms fade keep video playing
+behind the island from ever strobing the text.
+
 ## Architecture
 
 Direct2D layered window (per‑pixel alpha via `UpdateLayeredWindow`), a retained
