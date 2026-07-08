@@ -19,7 +19,7 @@ It draws a layered pill at the top of your monitor that morphs between three sta
   normally occupy, or after 15 seconds, whichever comes first.
 - **Hover peek** — big clock, date, weather detail, a live volume readout, a
   compact now-playing row (circular art + title/artist) when media is active,
-  and a mini "Up next" agenda. Scroll-wheel here adjusts volume too.
+  and a mini "Up next" agenda with a live "in X hr X min" countdown on the next event. Scroll-wheel here adjusts volume too.
 - **Control center** (click) — a pinned panel with:
   - **Now playing** — circular album art, friendly source name (Spotify/Edge/
     etc.), centered transport buttons with hover highlights, draggable scrub
