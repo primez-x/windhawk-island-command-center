@@ -4056,13 +4056,39 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
             }
             d.dc->FillRectangle(D2D1::RectF(b.left + 24 * sc, y + 5 * sc, b.right - 24 * sc, y + 6 * sc), d.divider);
             y += 16 * sc;
-            d.Text(L"Up next", d.fSmall, D2D1::RectF(b.left + 20 * sc, y, b.right - 20 * sc, y + 16 * sc), d.muted, 0.55f);
-            y += 20 * sc;
             auto evs = NextUpcomingEvents(3);
+            SYSTEMTIME nowSt; GetLocalTime(&nowSt);
+            // Live countdown to the next event, shown inline in the header ("Up next · in 1 hr
+            // 5 min") so the next commitment is glanceable without doing clock math; "now" once
+            // it has started, omitted beyond 24h where the row's weekday prefix reads better.
+            std::wstring rel;
+            if (!evs.empty() && !evs.front().allDay) {
+                FILETIME fn, fe; SYSTEMTIME es = evs.front().start;
+                SystemTimeToFileTime(&nowSt, &fn); SystemTimeToFileTime(&es, &fe);
+                long long diffMin = ((((long long)fe.dwHighDateTime << 32) | fe.dwLowDateTime) -
+                                     (((long long)fn.dwHighDateTime << 32) | fn.dwLowDateTime)) / 600000000LL;
+                if (diffMin <= 0) rel = L"now";
+                else if (diffMin < 24 * 60) {
+                    const long long hr = diffMin / 60, mn = diffMin % 60;
+                    rel = L"in ";
+                    if (hr > 0) { rel += std::to_wstring(hr) + L" hr"; if (mn > 0) rel += L" " + std::to_wstring(mn) + L" min"; }
+                    else rel += std::to_wstring(mn) + L" min";
+                }
+            }
+            D2D1_RECT_F hdr = D2D1::RectF(b.left + 20 * sc, y, b.right - 20 * sc, y + 16 * sc);
+            d.Text(L"Up next", d.fSmall, hdr, d.muted, 0.55f);
+            if (!rel.empty()) {
+                // Two-tone: muted dot separator, accent countdown, continuing the header line.
+                const float upW = d.MeasureWidth(d.fSmall, L"Up next");
+                const std::wstring sep = L"  \x00B7  ";
+                const float sepW = d.MeasureWidth(d.fSmall, sep);
+                d.Text(sep, d.fSmall, D2D1::RectF(hdr.left + upW, y, hdr.right, y + 16 * sc), d.muted, 0.55f);
+                d.Text(rel, d.fSmall, D2D1::RectF(hdr.left + upW + sepW, y, hdr.right, y + 16 * sc), d.accent, 0.9f);
+            }
+            y += 20 * sc;
             if (evs.empty()) {
                 d.Text(L"Nothing upcoming", d.fBody, D2D1::RectF(b.left, y, b.right, y + 22 * sc), d.muted, 0.5f, DWRITE_TEXT_ALIGNMENT_CENTER);
             } else {
-                SYSTEMTIME nowSt; GetLocalTime(&nowSt);
                 for (auto& e : evs) {
                     bool sameDay = (e.start.wYear == nowSt.wYear && e.start.wMonth == nowSt.wMonth && e.start.wDay == nowSt.wDay);
                     wchar_t tm[24] = {};
@@ -4073,32 +4099,9 @@ std::unique_ptr<Widget> Surface::BuildRoot(SurfaceState s, const DrawContext& dc
                         wchar_t dd[16] = {}; GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &e.start, L"ddd", dd, ARRAYSIZE(dd), nullptr);
                         when = std::wstring(dd) + L" " + tm;
                     }
-                    // First row gets a live "in X hr X min" countdown (right-aligned) so the next
-                    // commitment is glanceable without doing clock math; capped at 24h out since
-                    // beyond that the weekday-prefixed time already says it better.
-                    std::wstring rel;
-                    if (&e == &evs.front() && !e.allDay) {
-                        FILETIME fn, fe; SYSTEMTIME es = e.start;
-                        SystemTimeToFileTime(&nowSt, &fn); SystemTimeToFileTime(&es, &fe);
-                        long long diffMin = ((((long long)fe.dwHighDateTime << 32) | fe.dwLowDateTime) -
-                                             (((long long)fn.dwHighDateTime << 32) | fn.dwLowDateTime)) / 600000000LL;
-                        if (diffMin <= 0) rel = L"now";
-                        else if (diffMin < 24 * 60) {
-                            const long long hr = diffMin / 60, mn = diffMin % 60;
-                            rel = L"in ";
-                            if (hr > 0) { rel += std::to_wstring(hr) + L" hr"; if (mn > 0) rel += L" " + std::to_wstring(mn) + L" min"; }
-                            else rel += std::to_wstring(mn) + L" min";
-                        }
-                    }
-                    float subjRight = b.right - 16 * sc;
-                    if (!rel.empty()) {
-                        const float relW = d.MeasureWidth(d.fSmall, rel);
-                        d.Text(rel, d.fSmall, D2D1::RectF(subjRight - relW, y, subjRight, y + 22 * sc), d.accent, 0.9f);
-                        subjRight -= relW + 8 * sc;
-                    }
                     d.dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(b.left + 20 * sc, y + 4 * sc, b.left + 22.5f * sc, y + 20 * sc), 1.2f * sc, 1.2f * sc), d.accent);
                     d.Text(when, d.fSmall, D2D1::RectF(b.left + 30 * sc, y, b.left + 140 * sc, y + 22 * sc), d.muted, 0.8f);
-                    d.Text(e.subject, d.fBody, D2D1::RectF(b.left + 144 * sc, y, subjRight, y + 22 * sc), d.text, 0.92f);
+                    d.Text(e.subject, d.fBody, D2D1::RectF(b.left + 144 * sc, y, b.right - 16 * sc, y + 22 * sc), d.text, 0.92f);
                     y += 24 * sc;
                 }
             }
