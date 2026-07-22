@@ -2,7 +2,7 @@
 // @id              island-command-center
 // @name            Island Command Center
 // @description     An interactive island overlay: a unified, functional control & notification center inspired by the Dynamic Island design language.
-// @version         1.0.0
+// @version         1.1.0
 // @author          Matt Pincoski
 // @include         island-host.exe
 // @compilerOptions -lole32 -loleaut32 -lshcore -ld2d1 -ldwrite -ldwmapi -lgdi32 -luser32 -lshell32 -lruntimeobject -lwindowscodecs -lavrt -lsetupapi -lwinhttp -lpdh -ldxva2 -ladvapi32 -lwinmm -lcoremessaging -luuid
@@ -44,7 +44,19 @@ network) and a clock mod / the Taskbar Styler (clock).
   - bottom-center: Bottom center
 - TargetMonitor: "0"
   $name: Target monitor
-  $description: 0 = primary, 1-8 = that monitor, -1 = follow the mouse.
+  $description: >-
+    0 = primary, 1-8 = that monitor by its current Windows monitor number,
+    -1 = follow the mouse.
+
+
+    Monitor NUMBERS can shift after sleep/wake, docking, or a driver update
+    re-enumerates them. To pin the island to one physical monitor regardless
+    of numbering, type its name instead: "internal", "laptop", or "built-in"
+    always match the laptop's own built-in panel (detected by connector
+    type, since its EDID name is usually blank); anything else (e.g. "Dell",
+    "U2720Q") is matched case-insensitively against that monitor's EDID
+    name. Falls back to the primary monitor if the named one isn't
+    currently connected.
 - OffsetX: 0
   $name: Horizontal offset (px)
 - OffsetY: 0
@@ -1069,6 +1081,7 @@ bool g_backdropBlurLive = false;  // render-thread only: did BackdropBlurHost de
 struct Settings {
     Position position = Position::TopCenter;
     int targetMonitor = 0;
+    std::wstring targetMonitorName;  // non-empty overrides targetMonitor; see FindMonitorByName
     int offsetX = 0;
     int offsetY = 0;
     float sizeScale = 1.0f;
@@ -1099,8 +1112,17 @@ void LoadSettings() {
     else if (EqualsNoCase(pos, L"bottom-center")) next.position = Position::BottomCenter;
     else next.position = Position::TopCenter;
 
-    const std::wstring mon = GetStringSettingCopy(L"TargetMonitor");
-    next.targetMonitor = mon.empty() ? 0 : _wtoi(mon.c_str());
+    std::wstring mon = GetStringSettingCopy(L"TargetMonitor");
+    while (!mon.empty() && iswspace(mon.front())) mon.erase(mon.begin());
+    while (!mon.empty() && iswspace(mon.back())) mon.pop_back();
+    next.targetMonitor = 0;
+    next.targetMonitorName.clear();
+    if (!mon.empty()) {
+        wchar_t* end = nullptr;
+        long parsed = wcstol(mon.c_str(), &end, 10);
+        if (end != mon.c_str() && *end == L'\0') next.targetMonitor = static_cast<int>(parsed);
+        else next.targetMonitorName = mon;  // not a clean integer -> match by monitor name instead
+    }
     next.offsetX = Wh_GetIntSetting(L"OffsetX");
     next.offsetY = Wh_GetIntSetting(L"OffsetY");
     const std::wstring scale = GetStringSettingCopy(L"SizeScale");
@@ -3109,9 +3131,92 @@ BOOL CALLBACK MonitorEnumProc(HMONITOR h, HDC, LPRECT, LPARAM p) {
     reinterpret_cast<MonitorEnumData*>(p)->monitors.push_back(h);
     return TRUE;
 }
+
+// Resolves the TargetMonitor setting's name form (anything that isn't a clean 1-8 index) to an
+// HMONITOR. Enumeration order (and so the numeric index above) reshuffles across sleep/wake,
+// docking, or a driver re-scan, but a monitor's EDID identity and connector type don't -- so a
+// name match is the only way to reliably pin the island to one physical monitor, e.g. a laptop's
+// built-in panel. QueryDisplayConfig gives the EDID friendly name + connector technology per
+// active path; the GDI device name from its DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME query is
+// the join key back to the HMONITORs from EnumDisplayMonitors/GetMonitorInfoExW.
+struct MonitorNameInfo {
+    HMONITOR monitor;
+    std::wstring gdiDeviceName;
+    std::wstring friendlyName;  // EDID product string; often empty for laptop-internal panels
+    bool isInternal = false;    // built-in panel by connector type (eDP/LVDS), not by EDID text
+};
+bool ContainsNoCase(const std::wstring& haystack, const std::wstring& needle) {
+    if (needle.empty() || needle.size() > haystack.size()) return false;
+    return std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+                        [](wchar_t a, wchar_t b) { return towlower(a) == towlower(b); }) != haystack.end();
+}
+std::vector<MonitorNameInfo> EnumerateMonitorNameInfo() {
+    std::vector<MonitorNameInfo> result;
+    MonitorEnumData d;
+    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(&d));
+    for (HMONITOR h : d.monitors) {
+        MONITORINFOEXW mi = {}; mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(h, &mi)) result.push_back({h, mi.szDevice, L"", false});
+    }
+
+    UINT32 pathCount = 0, modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS || pathCount == 0)
+        return result;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) != ERROR_SUCCESS)
+        return result;
+
+    for (UINT32 i = 0; i < pathCount; ++i) {
+        const DISPLAYCONFIG_PATH_INFO& path = paths[i];
+
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
+        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        srcName.header.size = sizeof(srcName);
+        srcName.header.adapterId = path.sourceInfo.adapterId;
+        srcName.header.id = path.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS) continue;
+
+        auto it = std::find_if(result.begin(), result.end(), [&](const MonitorNameInfo& m) {
+            return EqualsNoCase(m.gdiDeviceName, srcName.viewGdiDeviceName);
+        });
+        if (it == result.end()) continue;
+
+        // The connector technology comes straight from the path itself, so the internal-panel
+        // check (the main reason a laptop screen needs name-based targeting at all) doesn't
+        // depend on the separate friendly-name query below succeeding.
+        it->isInternal = path.targetInfo.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL ||
+                          path.targetInfo.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED;
+
+        DISPLAYCONFIG_TARGET_DEVICE_NAME tgtName = {};
+        tgtName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        tgtName.header.size = sizeof(tgtName);
+        tgtName.header.adapterId = path.targetInfo.adapterId;
+        tgtName.header.id = path.targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&tgtName.header) == ERROR_SUCCESS)
+            it->friendlyName = tgtName.monitorFriendlyDeviceName;
+    }
+    return result;
+}
+HMONITOR FindMonitorByName(const std::wstring& query) {
+    std::vector<MonitorNameInfo> infos = EnumerateMonitorNameInfo();
+    const bool wantInternal = EqualsNoCase(query, L"internal") || EqualsNoCase(query, L"laptop") ||
+                               EqualsNoCase(query, L"built-in") || EqualsNoCase(query, L"builtin") ||
+                               EqualsNoCase(query, L"built-in display");
+    if (wantInternal)
+        for (const MonitorNameInfo& m : infos) if (m.isInternal) return m.monitor;
+    for (const MonitorNameInfo& m : infos)
+        if (!m.friendlyName.empty() && EqualsNoCase(m.friendlyName, query.c_str())) return m.monitor;
+    for (const MonitorNameInfo& m : infos)
+        if (ContainsNoCase(m.friendlyName, query)) return m.monitor;
+    return nullptr;
+}
 HMONITOR GetAnchorMonitor(const Settings& s) {
     if (s.targetMonitor == -1) { POINT pt; GetCursorPos(&pt); return MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST); }
-    if (s.targetMonitor > 0) {
+    if (!s.targetMonitorName.empty()) {
+        if (HMONITOR m = FindMonitorByName(s.targetMonitorName)) return m;
+        // Named monitor isn't currently connected -- fall through to the primary-monitor default.
+    } else if (s.targetMonitor > 0) {
         MonitorEnumData d;
         EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, reinterpret_cast<LPARAM>(&d));
         int i = s.targetMonitor - 1;
@@ -4740,6 +4845,17 @@ DWORD WINAPI RenderThreadProc(void*) {
     blurHost.Shutdown();
     renderer.Shutdown();
     if (g_hwnd) { DestroyWindow(g_hwnd); g_hwnd = nullptr; }
+    // Both window classes above are registered against GetModuleHandleW(nullptr) -- the HOST
+    // PROCESS's stable exe module -- while their WNDPROCs (OverlayWndProc / BlurHostWndProc)
+    // live inside THIS mod DLL. Windhawk can unload+reload the mod in-place (e.g. saving an
+    // Advanced-tab change like the process include/exclude list) without the host process ever
+    // exiting, so leaving these registered would make the next Wh_ModInit's RegisterClassExW
+    // silently no-op against the stale entry (ERROR_CLASS_ALREADY_EXISTS, ignored) and bind a
+    // fresh window to a WNDPROC pointer that now lives in freed memory -- the island then
+    // crashes or never reappears until the whole host process is relaunched by hand. Unregister
+    // both here, now that every window of each class is destroyed, so the next load starts clean.
+    UnregisterClassW(kWindowClass, GetModuleHandleW(nullptr));
+    UnregisterClassW(kBlurWindowClass, GetModuleHandleW(nullptr));
     if (SUCCEEDED(hrCo)) CoUninitialize();
     return 0;
 }
