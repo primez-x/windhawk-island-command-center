@@ -1,5 +1,12 @@
 # Island Command Center
 
+> **This repo has moved.** Active development now happens on the
+> [`island-command-center`](https://github.com/primez-x/windhawk-mods/tree/island-command-center),
+> [`island-host-watchdog`](https://github.com/primez-x/windhawk-mods/tree/island-host-watchdog), and
+> [`island-taskbar`](https://github.com/primez-x/windhawk-mods/tree/island-taskbar) branches of
+> [primez-x/windhawk-mods](https://github.com/primez-x/windhawk-mods), a fork of the official Windhawk
+> mods collection. This repo is kept for history and will be archived.
+
 A from-scratch, **interactive** Windhawk overlay for Windows 11 — an island-styled,
 unified **control + notification center** inspired by the Dynamic Island design
 language, but with genuinely functional widgets (not just a pretty display) and
